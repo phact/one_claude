@@ -6,6 +6,7 @@ from textual.widgets import Footer, Header
 
 from one_claude.config import Config
 from one_claude.core.scanner import ClaudeScanner
+from one_claude.teleport.sandbox import is_msb_available
 from one_claude.tui.screens.home import HomeScreen
 from one_claude.tui.screens.search import SearchScreen
 from one_claude.tui.screens.session import SessionScreen
@@ -115,6 +116,13 @@ class OneClaude(App):
         self.config = config or Config.load()
         self.scanner = ClaudeScanner(self.config.claude_dir)
 
+        # Check microsandbox availability
+        self.microsandbox_available = is_msb_available()
+
+        # Update subtitle to show sandbox mode
+        mode = "sandbox" if self.microsandbox_available else "local"
+        self.sub_title = f"Time Travel for Claude Code [{mode}]"
+
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
         yield Header()
@@ -157,54 +165,8 @@ class OneClaude(App):
 
 def run() -> None:
     """Run the one_claude TUI application."""
-    import subprocess
-    import asyncio
-
     app = OneClaude()
-    result = app.run()
-
-    # Debug: write result to file
-    with open("/tmp/one_claude_debug.txt", "w") as f:
-        f.write(f"Result type: {type(result)}\n")
-        f.write(f"Result: {result}\n")
-
-    # Handle teleport - launch shell after TUI exits
-    if isinstance(result, dict) and "teleport" in result:
-        import os
-        import sys
-
-        shell_cmd = result["teleport"]
-        teleport_session = result.get("cleanup")
-        isolated = result.get("isolated", False)
-        working_dir = teleport_session.sandbox.working_dir if teleport_session else None
-
-        mode = "isolated sandbox" if isolated else "local directory"
-        sys.stderr.write(f"\n🚀 Teleporting to checkpoint ({mode})...\n")
-        sys.stderr.write(f"   Working directory: {working_dir}\n")
-        sys.stderr.write(f"   Files restored: {len(teleport_session.files_restored) if teleport_session else 0}\n")
-        if teleport_session and teleport_session.files_restored:
-            sys.stderr.write(f"   Files: {list(teleport_session.files_restored.keys())[:5]}\n")
-        sys.stderr.write(f"\n   Type 'exit' to return and cleanup.\n\n")
-        sys.stderr.flush()
-
-        try:
-            # Change to working directory and exec into bash
-            if working_dir:
-                os.chdir(working_dir)
-            os.execvp("bash", ["bash", "-i"])
-        except Exception as e:
-            sys.stderr.write(f"\n❌ Failed to launch shell: {e}\n")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Note: execvp replaces process, so this only runs on error
-            if teleport_session:
-                sys.stderr.write("\n🧹 Cleaning up teleport session...\n")
-                try:
-                    asyncio.run(teleport_session.sandbox.stop())
-                except Exception as e:
-                    sys.stderr.write(f"   Cleanup error: {e}\n")
-                sys.stderr.write("   Done.\n")
+    app.run()
 
 
 if __name__ == "__main__":

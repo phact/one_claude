@@ -191,6 +191,11 @@ class Session:
     # File checkpoints for this session
     checkpoints: list[FileCheckpoint] = field(default_factory=list)
 
+    # Agent/subagent tracking
+    is_agent: bool = False  # True if this is a subagent session (agent-XXXX)
+    parent_session_id: str | None = None  # Parent session ID if this is an agent
+    child_agent_ids: list[str] = field(default_factory=list)  # Agent session IDs spawned from this session
+
 
 @dataclass
 class Project:

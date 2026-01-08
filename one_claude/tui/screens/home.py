@@ -2,6 +2,11 @@
 
 from datetime import datetime
 
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None  # type: ignore
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -21,12 +26,15 @@ class SessionListItem(ListItem):
 
     def compose(self) -> ComposeResult:
         """Create the session item display."""
-        yield Static(self.session.title or "Untitled", classes="session-title")
+        title = self.session.title or "Untitled"
+        session_id = self.session.id[:8]
         checkpoint_str = f"  {self.session.checkpoint_count} cp" if self.session.checkpoint_count else ""
-        yield Static(
-            f"{self._get_project_name()}  {self._format_time()}  {self.session.message_count} msgs{checkpoint_str}",
-            classes="session-meta",
-        )
+        meta = f"{self._get_project_name()}  {self._format_time()}  {self.session.message_count} msgs{checkpoint_str}"
+
+        with Horizontal(classes="session-row"):
+            yield Static(title, classes="session-title")
+            yield Static(session_id, classes="session-id")
+        yield Static(meta, classes="session-meta")
 
     def _get_project_name(self) -> str:
         """Get short project name."""
@@ -97,6 +105,7 @@ class HomeScreen(Screen):
         Binding("/", "focus_search", "/ Search"),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("tab", "switch_focus", "Tab Switch", show=False),
+        Binding("c", "copy_session_id", "Copy ID"),
     ]
 
     DEFAULT_CSS = """
@@ -110,6 +119,33 @@ class HomeScreen(Screen):
         width: 100%;
         height: 1fr;
         margin-top: 1;
+    }
+
+    HomeScreen #session-list {
+        width: 100%;
+    }
+
+    SessionListItem {
+        width: 100%;
+        height: auto;
+    }
+
+    SessionListItem .session-row {
+        width: 100%;
+        height: 1;
+    }
+
+    SessionListItem .session-title {
+        width: 1fr;
+    }
+
+    SessionListItem .session-id {
+        width: 9;
+        color: $text-muted;
+    }
+
+    SessionListItem .session-meta {
+        width: 100%;
     }
     """
 
@@ -152,10 +188,12 @@ class HomeScreen(Screen):
         for project in self.projects:
             project_list.append(ProjectListItem(project))
 
-        # Build all sessions list
+        # Build all sessions list (excluding agent sessions)
         self.all_sessions = []
         for project in self.projects:
-            self.all_sessions.extend(project.sessions)
+            for session in project.sessions:
+                if not session.is_agent:
+                    self.all_sessions.append(session)
         self.all_sessions.sort(key=lambda s: s.updated_at, reverse=True)
 
         # Show sessions
@@ -166,9 +204,9 @@ class HomeScreen(Screen):
         session_list = self.query_one("#session-list", ListView)
         session_list.clear()
 
-        # Start with all or project-filtered sessions
+        # Start with all or project-filtered sessions (excluding agents)
         if self.selected_project:
-            base_sessions = self.selected_project.sessions
+            base_sessions = [s for s in self.selected_project.sessions if not s.is_agent]
         else:
             base_sessions = self.all_sessions
 
@@ -262,3 +300,18 @@ class HomeScreen(Screen):
             self.search_query = ""
             self._update_session_list()
             self.query_one("#session-list", ListView).focus()
+
+    def action_copy_session_id(self) -> None:
+        """Copy selected session ID to clipboard."""
+        session_list = self.query_one("#session-list", ListView)
+        if session_list.index is not None and session_list.index < len(self.sessions):
+            session = self.sessions[session_list.index]
+            if pyperclip:
+                try:
+                    pyperclip.copy(session.id)
+                    self.app.notify(f"Copied: {session.id[:8]}...")
+                    return
+                except Exception:
+                    pass
+            # Fallback: just show the ID
+            self.app.notify(f"ID: {session.id}")

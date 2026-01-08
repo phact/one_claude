@@ -2,12 +2,17 @@
 
 from datetime import datetime
 
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None  # type: ignore
+
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import ScrollableContainer
+from textual.containers import Horizontal, ScrollableContainer
 from textual.message import Message as TextualMessage
 from textual.screen import Screen
-from textual.widgets import Input, Label, Static
+from textual.widgets import Collapsible, Input, Label, Static
 
 from one_claude.core.models import Message, MessageType, Session
 from one_claude.core.scanner import ClaudeScanner
@@ -214,9 +219,24 @@ class SessionScreen(Screen):
         Binding("N", "prev_match", "N Prev", show=False),
         Binding("tab", "next_checkpoint", "Tab Next CP"),
         Binding("shift+tab", "prev_checkpoint", "S-Tab Prev CP", show=False),
+        Binding("c", "copy_session_id", "Copy ID"),
     ]
 
     DEFAULT_CSS = """
+    SessionScreen #session-header-row {
+        width: 100%;
+        height: 1;
+    }
+
+    SessionScreen #session-title {
+        width: 1fr;
+    }
+
+    SessionScreen #session-id {
+        width: auto;
+        color: $text-muted;
+    }
+
     SessionScreen .message-summary {
         background: $warning-muted;
         border: solid $warning;
@@ -253,6 +273,15 @@ class SessionScreen(Screen):
     SessionScreen .search-match {
         background: $warning;
     }
+
+    SessionScreen .agent-session {
+        margin-left: 2;
+        padding: 0 1;
+    }
+
+    SessionScreen .agent-title {
+        color: $text-muted;
+    }
     """
 
     def __init__(self, session: Session, scanner: ClaudeScanner):
@@ -273,15 +302,33 @@ class SessionScreen(Screen):
         # Search input (hidden by default)
         yield Input(placeholder="/search...", id="search-input")
 
-        # Header with session info
-        yield Static(
-            f" {self.session.title or 'Untitled Session'}",
-            id="session-header",
-        )
+        # Header with session info and ID
+        with Horizontal(id="session-header-row"):
+            yield Static(
+                f" {self.session.title or 'Untitled Session'}",
+                id="session-title",
+            )
+            yield Static(
+                self.session.id[:8],
+                id="session-id",
+            )
         yield Static(
             f"  {self.session.project_display}",
             id="session-meta",
         )
+
+        # Agent sessions (if any)
+        if self.session.child_agent_ids:
+            agent_count = len(self.session.child_agent_ids)
+            with Collapsible(title=f"Subagents ({agent_count})", collapsed=True, id="agents-collapsible"):
+                for agent_id in self.session.child_agent_ids:
+                    agent_session = self.scanner.get_session_by_id(agent_id)
+                    if agent_session:
+                        short_id = agent_id.replace("agent-", "")[:7]
+                        title = agent_session.title or "Untitled"
+                        if len(title) > 60:
+                            title = title[:57] + "..."
+                        yield Static(f"  {short_id}: {title}", classes="agent-session agent-title")
 
         # Message list
         yield ScrollableContainer(id="message-container")
@@ -433,6 +480,7 @@ class SessionScreen(Screen):
     async def _do_teleport(self) -> None:
         """Execute the teleport and launch shell."""
         import subprocess
+        import sys
         from one_claude.teleport.restore import FileRestorer
 
         self.app.notify("Restoring files...")
@@ -452,16 +500,30 @@ class SessionScreen(Screen):
                 self.app.notify("No files to restore at this checkpoint", severity="warning")
                 return
 
-            # Get shell command from sandbox
+            # Get shell command and working directory
             sandbox = teleport_session.sandbox
             shell_cmd = sandbox.get_shell_command()
+            working_dir = sandbox.working_dir
 
-            # Exit TUI and launch shell
-            self.app.exit(result={
-                "teleport": shell_cmd,
-                "cleanup": teleport_session,
-                "isolated": sandbox.isolated,
-            })
+            # Suspend TUI and run shell (like k9s exec)
+            mode = "sandbox" if sandbox.isolated else "local"
+            with self.app.suspend():
+                sys.stderr.write(f"\n🚀 Teleporting to checkpoint [{mode}]...\n")
+                sys.stderr.write(f"   Working directory: {working_dir}\n")
+                sys.stderr.write(f"   Files restored: {files_count}\n")
+                sys.stderr.write(f"\n   Layout: Claude Code (left) | Terminal (right)\n")
+                sys.stderr.write(f"   Exit tmux with: Ctrl-b d (detach) or exit both panes\n\n")
+                sys.stderr.flush()
+
+                # Run tmux session in foreground
+                subprocess.run(shell_cmd, cwd=working_dir)
+
+            # Cleanup temp directory after shell exits
+            self.app.notify("Cleaning up...")
+            await sandbox.stop()
+
+            # TUI resumes here automatically
+            self.app.notify(f"Returned from teleport ({files_count} files)")
 
         except Exception as e:
             self.app.notify(f"Teleport error: {e}", severity="error")
@@ -538,3 +600,15 @@ class SessionScreen(Screen):
             widget.remove_class("search-match")
         self.match_widgets = []
         self.current_match_index = -1
+
+    def action_copy_session_id(self) -> None:
+        """Copy session ID to clipboard."""
+        if pyperclip:
+            try:
+                pyperclip.copy(self.session.id)
+                self.app.notify(f"Copied: {self.session.id[:8]}...")
+                return
+            except Exception:
+                pass
+        # Fallback: just show the ID
+        self.app.notify(f"ID: {self.session.id}")

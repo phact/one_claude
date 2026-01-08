@@ -46,6 +46,14 @@ class ClaudeScanner:
             if session:
                 project.sessions.append(session)
 
+        # Link agent sessions to their parents
+        sessions_by_id = {s.id: s for s in project.sessions}
+        for session in project.sessions:
+            if session.is_agent and session.parent_session_id:
+                parent = sessions_by_id.get(session.parent_session_id)
+                if parent:
+                    parent.child_agent_ids.append(session.id)
+
         # Sort sessions by updated_at descending
         project.sessions.sort(key=lambda s: s.updated_at, reverse=True)
 
@@ -59,6 +67,10 @@ class ClaudeScanner:
 
             # Extract session ID from filename
             session_id = jsonl_path.stem
+
+            # Detect if this is an agent session by filename pattern
+            is_agent = session_id.startswith("agent-")
+            parent_session_id: str | None = None
 
             # Quick scan for message count and first timestamp
             message_count = 0
@@ -75,6 +87,11 @@ class ClaudeScanner:
                         continue
                     try:
                         data = orjson.loads(line)
+
+                        # Check for parent session ID in agent sessions
+                        if is_agent and parent_session_id is None:
+                            parent_session_id = data.get("sessionId")
+
                         msg_type = data.get("type")
                         if msg_type == "file-history-snapshot":
                             checkpoint_count += 1
@@ -124,6 +141,8 @@ class ClaudeScanner:
                 message_count=message_count,
                 checkpoint_count=checkpoint_count,
                 title=title,
+                is_agent=is_agent,
+                parent_session_id=parent_session_id,
             )
 
         except Exception:
@@ -138,8 +157,8 @@ class ClaudeScanner:
         title = first_message.strip()
         title = re.sub(r"\s+", " ", title)  # Normalize whitespace
 
-        if len(title) > 60:
-            title = title[:57] + "..."
+        if len(title) > 200:
+            title = title[:197] + "..."
 
         return title or "Untitled Session"
 
@@ -187,14 +206,34 @@ class ClaudeScanner:
 
         return checkpoints
 
-    def get_sessions_flat(self) -> list[Session]:
+    def get_sessions_flat(self, include_agents: bool = False) -> list[Session]:
         """Get all sessions across all projects as a flat list."""
         sessions = []
         for project in self.scan_all():
-            sessions.extend(project.sessions)
+            for session in project.sessions:
+                if include_agents or not session.is_agent:
+                    sessions.append(session)
         # Sort by updated_at descending
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return sessions
+
+    def get_session_by_id(self, session_id: str) -> Session | None:
+        """Get a session by its ID."""
+        for project in self.scan_all():
+            for session in project.sessions:
+                if session.id == session_id:
+                    return session
+        return None
+
+    def get_agent_sessions(self, parent_session_id: str) -> list[Session]:
+        """Get all agent sessions for a parent session."""
+        agents = []
+        for project in self.scan_all():
+            for session in project.sessions:
+                if session.is_agent and session.parent_session_id == parent_session_id:
+                    agents.append(session)
+        agents.sort(key=lambda s: s.created_at)
+        return agents
 
 
 def compute_path_hash(file_path: str) -> str:
