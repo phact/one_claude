@@ -45,8 +45,3 @@ one_claude show <session-id>
 | `/` | Search |
 | `t` | Teleport |
 | `q` | Quit |
-
-## License
-
-MIT
-# one_claude
