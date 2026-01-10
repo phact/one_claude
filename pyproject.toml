@@ -1,10 +1,9 @@
 [project]
 name = "one_claude"
 version = "0.1.0"
-description = "Atuin-like tool for Claude Code sessions - browse, search, and teleport across time"
+description = "TUI manager for Claude Code sessions - browse, search, and teleport across time"
 requires-python = ">=3.11"
 readme = "README.md"
-license = {text = "MIT"}
 
 dependencies = [
     "textual>=0.85.0",
