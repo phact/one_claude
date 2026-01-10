@@ -1,38 +1,24 @@
 # one_claude
 
-Atuin-like tool for Claude Code sessions - browse, search, and teleport across time.
+TUI manager for Claude Code sessions - browse, search, and teleport across time.
 
 ## Features
 
 - **TUI Browser**: Navigate all your Claude Code sessions with a terminal interface
-- **Search**: Text and semantic search across session content
+- **Search**: Text search across session content
 - **Teleport**: Restore file state from any point in session history using microsandbox
+
+
+## Roadmap:
+
 - **P2P Sync**: Sync sessions across devices (coming soon)
 - **S3 Backup**: Backup sessions to S3 (coming soon)
 
-## Installation
-
-```bash
-uv pip install -e .
-```
-
-## Usage
+## Usage 
 
 ```bash
 # Launch TUI
-one_claude
-
-# Or run as module
-python -m one_claude
-
-# List sessions
-one_claude sessions
-
-# List projects
-one_claude projects
-
-# Show a session
-one_claude show <session-id>
+uvx one_claude
 ```
 
 ## Keyboard Shortcuts
@@ -44,4 +30,5 @@ one_claude show <session-id>
 | `Esc` | Back |
 | `/` | Search |
 | `t` | Teleport |
+| `m` | Toggle execution mode |
 | `q` | Quit |
