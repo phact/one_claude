@@ -116,11 +116,11 @@ class OneClaude(App):
         self.config = config or Config.load()
         self.scanner = ClaudeScanner(self.config.claude_dir)
 
-        # Check microsandbox availability
-        self.microsandbox_available = is_msb_available()
+        # Check microsandbox availability for sandbox mode
+        self.sandbox_available = is_msb_available()
 
         # Update subtitle to show sandbox mode
-        mode = "sandbox" if self.microsandbox_available else "local"
+        mode = "sandbox" if self.sandbox_available else "local"
         self.sub_title = f"Time Travel for Claude Code [{mode}]"
 
     def compose(self) -> ComposeResult:

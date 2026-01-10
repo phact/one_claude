@@ -1,5 +1,10 @@
 """Home screen with session list."""
 
+import asyncio
+import os
+import shutil
+import subprocess
+import sys
 from datetime import datetime
 
 try:
@@ -15,6 +20,8 @@ from textual.widgets import Input, Label, ListItem, ListView, Static
 
 from one_claude.core.models import Project, Session
 from one_claude.core.scanner import ClaudeScanner
+from one_claude.index.search import SearchEngine
+from one_claude.teleport.executors import get_mode_names
 
 
 class SessionListItem(ListItem):
@@ -106,6 +113,8 @@ class HomeScreen(Screen):
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("tab", "switch_focus", "Tab Switch", show=False),
         Binding("c", "copy_session_id", "Copy ID"),
+        Binding("t", "teleport", "Teleport"),
+        Binding("m", "toggle_mode", "Mode"),
     ]
 
     DEFAULT_CSS = """
@@ -123,6 +132,16 @@ class HomeScreen(Screen):
 
     HomeScreen #session-list {
         width: 100%;
+    }
+
+    HomeScreen #mode-indicator {
+        dock: bottom;
+        width: 100%;
+        height: 1;
+        text-align: right;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 2;
     }
 
     SessionListItem {
@@ -152,16 +171,18 @@ class HomeScreen(Screen):
     def __init__(self, scanner: ClaudeScanner):
         super().__init__()
         self.scanner = scanner
+        self.search_engine = SearchEngine(scanner)
         self.projects: list[Project] = []
         self.sessions: list[Session] = []
         self.all_sessions: list[Session] = []  # Unfiltered
         self.selected_project: Project | None = None
         self.search_query: str = ""
+        self.teleport_mode: str = "docker"  # Default to docker
 
     def compose(self) -> ComposeResult:
         """Create the home screen layout."""
         # Search box at top
-        yield Input(placeholder="Search sessions... (/ to focus)", id="search-input")
+        yield Input(placeholder="Search titles & messages... (/ to focus)", id="search-input")
 
         with Horizontal(id="main-container"):
             with Vertical(classes="sidebar"):
@@ -170,6 +191,9 @@ class HomeScreen(Screen):
             with Vertical(classes="content"):
                 yield Label("Sessions", id="sessions-header")
                 yield ListView(id="session-list")
+
+        # Mode indicator at bottom right (markup=False to show literal brackets)
+        yield Static(f"[m] {self.teleport_mode}", id="mode-indicator", markup=False)
 
     def on_mount(self) -> None:
         """Load sessions on mount."""
@@ -212,12 +236,16 @@ class HomeScreen(Screen):
 
         # Apply search filter
         if self.search_query:
-            query = self.search_query.lower()
-            self.sessions = [
-                s for s in base_sessions
-                if query in (s.title or "").lower()
-                or query in s.project_display.lower()
-            ]
+            # Use SearchEngine for full-text search (titles + message content)
+            project_filter = self.selected_project.display_path if self.selected_project else None
+            results = self.search_engine.search(
+                self.search_query,
+                mode="text",
+                project_filter=project_filter,
+                limit=100,
+            )
+            # Extract sessions from results (already sorted by relevance)
+            self.sessions = [r.session for r in results]
         else:
             self.sessions = list(base_sessions)
 
@@ -315,3 +343,71 @@ class HomeScreen(Screen):
                     pass
             # Fallback: just show the ID
             self.app.notify(f"ID: {session.id}")
+
+    def action_toggle_mode(self) -> None:
+        """Toggle between teleport modes."""
+        modes = get_mode_names()
+        current_idx = modes.index(self.teleport_mode) if self.teleport_mode in modes else 0
+        next_idx = (current_idx + 1) % len(modes)
+        self.teleport_mode = modes[next_idx]
+
+        # Update the indicator
+        indicator = self.query_one("#mode-indicator", Static)
+        indicator.update(f"[m] {self.teleport_mode}")
+        self.app.notify(f"Teleport mode: {self.teleport_mode}")
+
+    def action_teleport(self) -> None:
+        """Teleport to the latest message of selected session."""
+        session_list = self.query_one("#session-list", ListView)
+        if session_list.index is not None and session_list.index < len(self.sessions):
+            session = self.sessions[session_list.index]
+            asyncio.create_task(self._do_teleport(session))
+        else:
+            self.app.notify("Select a session first")
+
+    async def _do_teleport(self, session) -> None:
+        """Execute teleport to latest message of session."""
+        from one_claude.teleport.restore import FileRestorer
+
+        mode_str = self.teleport_mode
+        self.app.notify(f"Teleporting to {session.id[:8]} ({mode_str})...")
+
+        try:
+            restorer = FileRestorer(self.scanner)
+
+            # Teleport to latest (no message_uuid = latest)
+            teleport_session = await restorer.restore_to_sandbox(
+                session,
+                message_uuid=None,  # Latest
+                mode=mode_str,  # local, docker, or microvm
+            )
+
+            files_count = len(teleport_session.files_restored)
+            sandbox = teleport_session.sandbox
+            working_dir = sandbox.working_dir
+
+            # Suspend TUI and run shell
+            with self.app.suspend():
+                term = os.environ.get("TERM")
+                term_size = shutil.get_terminal_size()
+
+                shell_cmd = sandbox.get_shell_command(
+                    term=term,
+                    lines=term_size.lines,
+                    columns=term_size.columns,
+                )
+
+                sys.stderr.write(f"\n🚀 Teleporting to {session.title or session.id[:8]} [{mode_str}]...\n")
+                sys.stderr.write(f"   Project: {session.project_display}\n")
+                sys.stderr.write(f"   Files restored: {files_count}\n")
+                sys.stderr.write(f"   Terminal: {term_size.columns}x{term_size.lines} ({term})\n\n")
+                sys.stderr.flush()
+
+                subprocess.run(shell_cmd, cwd=working_dir)
+
+            self.app.notify("Cleaning up...")
+            await sandbox.stop()
+            self.app.notify(f"Returned from teleport ({files_count} files)")
+
+        except Exception as e:
+            self.app.notify(f"Teleport error: {e}", severity="error")

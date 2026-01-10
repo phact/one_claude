@@ -1,0 +1,6 @@
+# Sandbox configurations
+sandboxes:
+  teleport:
+    image: phact/sandbox:v3
+    shell: /bin/bash
+    workdir: /workspace

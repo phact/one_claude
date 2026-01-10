@@ -1,5 +1,7 @@
 """Session detail screen showing the conversation."""
 
+import os
+import shutil
 from datetime import datetime
 
 try:
@@ -502,15 +504,25 @@ class SessionScreen(Screen):
 
             # Get shell command and working directory
             sandbox = teleport_session.sandbox
-            shell_cmd = sandbox.get_shell_command()
             working_dir = sandbox.working_dir
 
             # Suspend TUI and run shell (like k9s exec)
             mode = "sandbox" if sandbox.isolated else "local"
             with self.app.suspend():
+                # Get terminal info after TUI is suspended (real terminal is restored)
+                term = os.environ.get("TERM")
+                term_size = shutil.get_terminal_size()
+
+                shell_cmd = sandbox.get_shell_command(
+                    term=term,
+                    lines=term_size.lines,
+                    columns=term_size.columns,
+                )
+
                 sys.stderr.write(f"\n🚀 Teleporting to checkpoint [{mode}]...\n")
                 sys.stderr.write(f"   Working directory: {working_dir}\n")
                 sys.stderr.write(f"   Files restored: {files_count}\n")
+                sys.stderr.write(f"   Terminal: {term_size.columns}x{term_size.lines} ({term})\n")
                 sys.stderr.write(f"\n   Layout: Claude Code (left) | Terminal (right)\n")
                 sys.stderr.write(f"   Exit tmux with: Ctrl-b d (detach) or exit both panes\n\n")
                 sys.stderr.flush()

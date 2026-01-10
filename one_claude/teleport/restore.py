@@ -1,9 +1,12 @@
 """File restoration from checkpoints."""
 
 import hashlib
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+import orjson
 
 from one_claude.core.file_history import FileHistoryManager
 from one_claude.core.models import Message, MessageType, Session
@@ -43,23 +46,21 @@ class FileRestorer:
         self._path_cache: dict[str, dict[str, str]] = {}  # session_id -> {hash: path}
 
     def get_restorable_points(self, session: Session) -> list[RestorePoint]:
-        """Get list of points that can be restored."""
+        """Get list of points that can be restored (any message can be a restore point)."""
         tree = self.scanner.load_session_messages(session)
         checkpoints = self.file_history.get_checkpoints_for_session(session.id)
-
-        if not checkpoints:
-            return []
 
         points = []
         seen_messages = set()
 
-        # Walk through messages and find ones with file operations
+        # Walk through messages and create restore points
         for msg in tree.all_messages():
             if msg.uuid in seen_messages:
                 continue
             seen_messages.add(msg.uuid)
 
-            # Look for file-history-snapshot or assistant messages with file edits
+            # Any message can be a restore point
+            # But prioritize ones with file operations for the description
             if msg.type == MessageType.FILE_HISTORY_SNAPSHOT:
                 points.append(
                     RestorePoint(
@@ -81,10 +82,29 @@ class FileRestorer:
                             file_count=len(file_tools),
                         )
                     )
+            elif msg.type == MessageType.USER:
+                # User messages as restore points too
+                content_preview = ""
+                if isinstance(msg.content, str):
+                    content_preview = msg.content[:30] + "..." if len(msg.content) > 30 else msg.content
+                elif isinstance(msg.content, list):
+                    for item in msg.content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            content_preview = text[:30] + "..." if len(text) > 30 else text
+                            break
+                points.append(
+                    RestorePoint(
+                        message_uuid=msg.uuid,
+                        timestamp=msg.timestamp,
+                        description=content_preview or "User message",
+                        file_count=0,
+                    )
+                )
 
         # Sort by timestamp descending
         points.sort(key=lambda p: p.timestamp, reverse=True)
-        return points[:20]  # Limit to 20 restore points
+        return points[:50]  # Limit to 50 restore points
 
     def build_path_mapping(self, session: Session) -> dict[str, str]:
         """Build mapping from path hashes to original paths."""
@@ -108,10 +128,70 @@ class FileRestorer:
         """Compute path hash matching Claude Code's format."""
         return hashlib.sha256(path.encode()).hexdigest()[:16]
 
+    def _truncate_jsonl_to_message(
+        self,
+        jsonl_path: Path,
+        target_uuid: str,
+    ) -> bytes:
+        """Read JSONL and truncate to include only messages up to target_uuid.
+
+        Returns the truncated JSONL content as bytes.
+        If target_uuid is empty, returns all lines (for "latest" teleport).
+        """
+        lines_to_keep = []
+
+        with open(jsonl_path, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    data = orjson.loads(line)
+                except Exception:
+                    continue
+
+                lines_to_keep.append(line)
+
+                # If we have a specific target, stop when we find it
+                if target_uuid:
+                    msg_uuid = data.get("uuid", "")
+                    if msg_uuid == target_uuid:
+                        break
+
+        return b"\n".join(lines_to_keep) + b"\n"
+
+    def _get_file_history_for_session(self, session: Session) -> dict[str, bytes]:
+        """Get all file history checkpoints for a session.
+
+        Returns a dict of {filename: content} for files to copy.
+        File-history structure is flat: file-history/<session_id>/<hash>@v1
+        """
+        file_history_files: dict[str, bytes] = {}
+
+        # Get the file-history directory for this session
+        fh_session_dir = self.scanner.file_history_dir / session.id
+        if not fh_session_dir.exists():
+            return file_history_files
+
+        # Walk through all checkpoint files (flat structure)
+        for cp_file in fh_session_dir.iterdir():
+            if cp_file.is_dir():
+                continue
+            try:
+                content = cp_file.read_bytes()
+                # Just use the filename (e.g., "hash@v1")
+                file_history_files[cp_file.name] = content
+            except Exception:
+                continue
+
+        return file_history_files
+
     async def restore_to_sandbox(
         self,
         session: Session,
         message_uuid: str | None = None,
+        mode: str = "docker",
     ) -> TeleportSession:
         """
         Restore files to sandbox at specified point.
@@ -119,48 +199,73 @@ class FileRestorer:
         Args:
             session: Session to restore
             message_uuid: Message to restore to (latest if None)
+            mode: Execution mode - "local", "docker", or "microvm"
         """
-        # Create sandbox (auto-detects microsandbox vs local mode)
-        sandbox = TeleportSandbox(session.id, session.project_display)
-
+        # Create sandbox with project path (use display path for actual filesystem path)
+        sandbox = TeleportSandbox(
+            session_id=session.id,
+            project_path=session.project_display,
+            mode=mode,
+        )
         await sandbox.start()
 
-        # Get file checkpoints
+        # Get file checkpoints and path mapping
         checkpoints = self.file_history.get_checkpoints_for_session(session.id)
         path_mapping = self.build_path_mapping(session)
 
         files_restored: dict[str, str] = {}
 
-        # Restore each file (latest version for now)
+        # Restore each file (latest version available)
         for path_hash, versions in checkpoints.items():
             if not versions:
                 continue
 
-            # Get latest version
-            latest = versions[-1]
+            # Use latest version (versions are sorted by version number)
+            # TODO: Filter by target timestamp if we add mtime to FileCheckpoint
+            applicable_version = versions[-1] if versions else None
+
+            if not applicable_version:
+                continue
 
             # Resolve original path
             original_path = path_mapping.get(path_hash)
             if not original_path:
-                # Can't restore without knowing original path
                 continue
 
             # Read checkpoint content
             try:
-                content = latest.read_content()
+                content = applicable_version.read_content()
             except Exception:
                 continue
 
-            # Construct sandbox path
-            # Strip leading / and prepend workspace
-            relative_path = original_path.lstrip("/")
-            sandbox_path = f"{sandbox.working_dir}/{relative_path}"
-
-            # Write to sandbox
-            await sandbox.write_file(sandbox_path, content)
+            # Write to sandbox at the original absolute path location
+            # The workspace is mounted at /workspace, and we preserve the full path
+            await sandbox.write_file(original_path, content)
             files_restored[original_path] = path_hash
 
-        import uuid
+        # Setup claude config directory
+        source_claude_dir = self.scanner.claude_dir
+        # Inside sandbox, CWD is /workspace/<original-path>, so Claude will look for
+        # projects/-workspace-<original-path>/. We need to match that.
+        sandbox_project_path = f"/workspace{session.project_display}"
+        project_dir_name = sandbox_project_path.replace("/", "-")
+
+        # Create truncated JSONL
+        jsonl_content = self._truncate_jsonl_to_message(
+            session.jsonl_path,
+            message_uuid or "",
+        )
+
+        # Get all file history for the session
+        file_history_files = self._get_file_history_for_session(session)
+
+        # Setup the claude config in sandbox
+        sandbox.setup_claude_config(
+            source_claude_dir=source_claude_dir,
+            project_dir_name=project_dir_name,
+            jsonl_content=jsonl_content,
+            file_history_files=file_history_files,
+        )
 
         return TeleportSession(
             id=str(uuid.uuid4()),
