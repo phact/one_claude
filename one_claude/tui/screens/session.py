@@ -349,6 +349,11 @@ class SessionScreen(Screen):
         self._message_tree: MessageTree | None = None
         # Fork point UUIDs in this path (for branch indicator)
         self._fork_points: set[str] = set()
+        # All display messages (for lazy loading)
+        self._all_display_messages: list[Message] = []
+        # Gap in the middle (unrendered messages between top and bottom)
+        self._gap_start: int = 0  # First unrendered index
+        self._gap_end: int = 0  # Last unrendered index (exclusive)
 
     def compose(self) -> ComposeResult:
         """Create the session screen layout."""
@@ -383,6 +388,11 @@ class SessionScreen(Screen):
         # Scroll to bottom and select last checkpoint
         self.call_after_refresh(self._scroll_to_end_and_select_last)
 
+    # Number of messages to render at each end initially (for gg and G)
+    INITIAL_RENDER_COUNT = 50
+    # Number of messages to load when scrolling
+    LOAD_MORE_COUNT = 50
+
     def _load_messages(self) -> None:
         """Load and display messages."""
         container = self.query_one("#message-container", ScrollableContainer)
@@ -403,13 +413,13 @@ class SessionScreen(Screen):
         display_types = [MessageType.USER, MessageType.ASSISTANT, MessageType.SUMMARY, MessageType.FILE_HISTORY_SNAPSHOT]
         if self.show_system:
             display_types.append(MessageType.SYSTEM)
-        display_messages = [m for m in messages if m.type in display_types]
+        self._all_display_messages = [m for m in messages if m.type in display_types]
 
         # Count checkpoints
-        checkpoint_count = sum(1 for m in display_messages if m.type == MessageType.FILE_HISTORY_SNAPSHOT)
+        checkpoint_count = sum(1 for m in self._all_display_messages if m.type == MessageType.FILE_HISTORY_SNAPSHOT)
 
         # Update header with info
-        self.displayed_count = len(display_messages)
+        self.displayed_count = len(self._all_display_messages)
         meta = self.query_one("#session-meta", Static)
         branch_str = ""
         if self.path.sibling_leaf_uuids:
@@ -418,10 +428,31 @@ class SessionScreen(Screen):
         cp_str = f"  {checkpoint_count} checkpoints" if checkpoint_count else ""
         meta.update(f"  {self.path.project_display}  {self.displayed_count} messages{branch_str}{cp_str}")
 
-        # Create message widgets and track all + checkpoints
+        # Track rendered ranges - we render top and bottom for gg/G support
+        total = len(self._all_display_messages)
+
+        # For small conversations, just render everything
+        if total <= self.INITIAL_RENDER_COUNT * 2:
+            self._gap_start = total  # No gap
+            self._gap_end = total
+        else:
+            # Render first N and last N messages, with a gap in the middle
+            self._gap_start = self.INITIAL_RENDER_COUNT  # End of top section
+            self._gap_end = total - self.INITIAL_RENDER_COUNT  # Start of bottom section
+
+        # Create message widgets for both ends
         self.message_widgets = []
         self.checkpoint_widgets = []
-        for i, msg in enumerate(display_messages, start=1):
+        self._render_messages(container, 0, self._gap_start)  # Top section
+        if self._gap_end < total:
+            self._render_messages(container, self._gap_end, total)  # Bottom section
+
+    def _render_messages(self, container, start_idx: int, end_idx: int, prepend: bool = False) -> None:
+        """Render messages in the given range."""
+        messages_to_render = self._all_display_messages[start_idx:end_idx]
+        new_widgets = []
+
+        for i, msg in enumerate(messages_to_render, start=start_idx + 1):
             has_branch = msg.uuid in self._fork_points
             widget = MessageWidget(
                 msg,
@@ -429,10 +460,147 @@ class SessionScreen(Screen):
                 show_thinking=True,
                 has_branch=has_branch,
             )
-            container.mount(widget)
-            self.message_widgets.append(widget)
+            new_widgets.append(widget)
             if msg.type == MessageType.FILE_HISTORY_SNAPSHOT:
                 self.checkpoint_widgets.append(widget)
+
+        if prepend:
+            # Insert at the beginning
+            for widget in reversed(new_widgets):
+                container.mount(widget, before=0)
+            self.message_widgets = new_widgets + self.message_widgets
+        else:
+            # Append at the end
+            for widget in new_widgets:
+                container.mount(widget)
+            self.message_widgets.extend(new_widgets)
+
+    def _load_more_at_top(self) -> bool:
+        """Load more messages at the top of the gap. Returns True if more were loaded."""
+        if self._gap_start >= self._gap_end:
+            return False  # No gap left
+
+        container = self.query_one("#message-container", ScrollableContainer)
+
+        # Calculate new range - expand top section into the gap
+        new_end = min(self._gap_start + self.LOAD_MORE_COUNT, self._gap_end)
+
+        # Find the widget index where we need to insert (after current top section)
+        insert_idx = self._gap_start
+
+        # Render the new messages
+        messages_to_render = self._all_display_messages[self._gap_start:new_end]
+        new_widgets = []
+        for i, msg in enumerate(messages_to_render, start=self._gap_start + 1):
+            has_branch = msg.uuid in self._fork_points
+            widget = MessageWidget(msg, turn_number=i, show_thinking=True, has_branch=has_branch)
+            new_widgets.append(widget)
+            if msg.type == MessageType.FILE_HISTORY_SNAPSHOT:
+                self.checkpoint_widgets.append(widget)
+
+        # Insert after the top section
+        for j, widget in enumerate(new_widgets):
+            container.mount(widget, before=insert_idx + j)
+
+        # Insert into message_widgets at the right position
+        self.message_widgets = (
+            self.message_widgets[:insert_idx] +
+            new_widgets +
+            self.message_widgets[insert_idx:]
+        )
+
+        self._gap_start = new_end
+        return True
+
+    def _load_more_at_bottom(self) -> bool:
+        """Load more messages at the bottom of the gap. Returns True if more were loaded."""
+        if self._gap_start >= self._gap_end:
+            return False  # No gap left
+
+        container = self.query_one("#message-container", ScrollableContainer)
+
+        # Calculate new range - expand bottom section into the gap
+        new_start = max(self._gap_end - self.LOAD_MORE_COUNT, self._gap_start)
+
+        # Find the widget index where the bottom section starts
+        bottom_section_start = self._gap_start
+
+        # Render the new messages
+        messages_to_render = self._all_display_messages[new_start:self._gap_end]
+        new_widgets = []
+        for i, msg in enumerate(messages_to_render, start=new_start + 1):
+            has_branch = msg.uuid in self._fork_points
+            widget = MessageWidget(msg, turn_number=i, show_thinking=True, has_branch=has_branch)
+            new_widgets.append(widget)
+            if msg.type == MessageType.FILE_HISTORY_SNAPSHOT:
+                self.checkpoint_widgets.append(widget)
+
+        # Insert before the bottom section
+        for j, widget in enumerate(new_widgets):
+            container.mount(widget, before=bottom_section_start + j)
+
+        # Insert into message_widgets at the right position
+        self.message_widgets = (
+            self.message_widgets[:bottom_section_start] +
+            new_widgets +
+            self.message_widgets[bottom_section_start:]
+        )
+
+        self._gap_end = new_start
+        return True
+
+    def _fill_gap(self) -> None:
+        """Fill the entire gap (for seamless navigation)."""
+        while self._gap_start < self._gap_end:
+            self._load_more_at_top()
+
+    def _widget_index_to_message_index(self, widget_idx: int) -> int:
+        """Convert widget list index to actual message index."""
+        if self._gap_start >= self._gap_end:
+            # No gap, indices match
+            return widget_idx
+        # Top section: widget indices 0 to gap_start-1 map directly
+        if widget_idx < self._gap_start:
+            return widget_idx
+        # Bottom section: widget indices gap_start+ map to gap_end+
+        return self._gap_end + (widget_idx - self._gap_start)
+
+    def _message_index_to_widget_index(self, msg_idx: int) -> int | None:
+        """Convert message index to widget list index. Returns None if in gap."""
+        if self._gap_start >= self._gap_end:
+            # No gap, indices match
+            return msg_idx
+        # In top section
+        if msg_idx < self._gap_start:
+            return msg_idx
+        # In gap - not loaded
+        if msg_idx < self._gap_end:
+            return None
+        # In bottom section
+        return self._gap_start + (msg_idx - self._gap_end)
+
+    def _ensure_message_loaded(self, msg_idx: int) -> int:
+        """Ensure message at index is loaded, return widget index."""
+        widget_idx = self._message_index_to_widget_index(msg_idx)
+        if widget_idx is not None:
+            return widget_idx
+
+        # Message is in gap - load incrementally from the closer end
+        # Determine which end is closer
+        dist_from_top = msg_idx - self._gap_start
+        dist_from_bottom = self._gap_end - msg_idx - 1
+
+        if dist_from_top <= dist_from_bottom:
+            # Closer to top section - expand downward
+            while self._gap_start <= msg_idx and self._gap_start < self._gap_end:
+                self._load_more_at_top()
+            return msg_idx  # After loading, index matches
+        else:
+            # Closer to bottom section - expand upward
+            while self._gap_end > msg_idx and self._gap_start < self._gap_end:
+                self._load_more_at_bottom()
+            # Recalculate widget index after loading
+            return self._message_index_to_widget_index(msg_idx)
 
     def _scroll_to_end_and_select_last(self) -> None:
         """Scroll to bottom and select last message."""
@@ -461,33 +629,46 @@ class SessionScreen(Screen):
         container.scroll_down()
 
     def action_scroll_up(self) -> None:
-        """Scroll up."""
+        """Scroll up, loading more messages if approaching gap."""
         container = self.query_one("#message-container", ScrollableContainer)
+        # Check if near top of visible area and load more if gap exists
+        if container.scroll_y < 200 and self._gap_start < self._gap_end:
+            self._load_more_at_top()
         container.scroll_up()
 
     def action_scroll_top(self) -> None:
-        """Select first message."""
+        """Select first message (already preloaded)."""
         if self.message_widgets:
             self._select_message_widget(self.message_widgets[0])
 
     def action_scroll_bottom(self) -> None:
-        """Select last message."""
+        """Select last message (already preloaded at bottom)."""
         if self.message_widgets:
+            # Last message is always at the end of message_widgets
             self._select_message_widget(self.message_widgets[-1])
 
     def action_page_down(self) -> None:
         """Move selection down by 5 messages."""
         if not self.message_widgets:
             return
-        new_idx = min(self.current_message_index + 5, len(self.message_widgets) - 1)
-        self._select_message_widget(self.message_widgets[new_idx])
+        total_messages = len(self._all_display_messages)
+        # Get current message index (not widget index)
+        current_msg_idx = self._widget_index_to_message_index(self.current_message_index)
+        new_msg_idx = min(current_msg_idx + 5, total_messages - 1)
+        # Ensure target is loaded and get widget index
+        widget_idx = self._ensure_message_loaded(new_msg_idx)
+        self._select_message_widget(self.message_widgets[widget_idx])
 
     def action_page_up(self) -> None:
         """Move selection up by 5 messages."""
         if not self.message_widgets:
             return
-        new_idx = max(self.current_message_index - 5, 0)
-        self._select_message_widget(self.message_widgets[new_idx])
+        # Get current message index (not widget index)
+        current_msg_idx = self._widget_index_to_message_index(self.current_message_index)
+        new_msg_idx = max(current_msg_idx - 5, 0)
+        # Ensure target is loaded and get widget index
+        widget_idx = self._ensure_message_loaded(new_msg_idx)
+        self._select_message_widget(self.message_widgets[widget_idx])
 
     def on_message_clicked(self, event: MessageClicked) -> None:
         """Handle message click."""
@@ -530,15 +711,22 @@ class SessionScreen(Screen):
         """Go to next message."""
         if not self.message_widgets:
             return
-        if self.current_message_index < len(self.message_widgets) - 1:
-            self._select_message_widget(self.message_widgets[self.current_message_index + 1])
+        total_messages = len(self._all_display_messages)
+        current_msg_idx = self._widget_index_to_message_index(self.current_message_index)
+        if current_msg_idx < total_messages - 1:
+            new_msg_idx = current_msg_idx + 1
+            widget_idx = self._ensure_message_loaded(new_msg_idx)
+            self._select_message_widget(self.message_widgets[widget_idx])
 
     def action_prev_message(self) -> None:
         """Go to previous message."""
         if not self.message_widgets:
             return
-        if self.current_message_index > 0:
-            self._select_message_widget(self.message_widgets[self.current_message_index - 1])
+        current_msg_idx = self._widget_index_to_message_index(self.current_message_index)
+        if current_msg_idx > 0:
+            new_msg_idx = current_msg_idx - 1
+            widget_idx = self._ensure_message_loaded(new_msg_idx)
+            self._select_message_widget(self.message_widgets[widget_idx])
 
     def action_next_checkpoint(self) -> None:
         """Go to next checkpoint."""

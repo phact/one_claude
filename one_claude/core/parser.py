@@ -1,10 +1,13 @@
 """JSONL parsing for Claude Code session files."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import simdjson
+
+# Cache UTC timezone for faster timestamp parsing
+_UTC = timezone.utc
 
 from one_claude.core.models import (
     Message,
@@ -128,12 +131,18 @@ class SessionParser:
         if not uuid:
             return None
 
-        # Parse timestamp
+        # Parse timestamp - optimize for Z-suffix (most common)
         timestamp_str = _to_str(doc.get("timestamp")) or ""
         try:
-            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            if timestamp_str and timestamp_str[-1] == "Z":
+                # Parse without Z, then attach UTC timezone directly
+                timestamp = datetime.fromisoformat(timestamp_str[:-1]).replace(tzinfo=_UTC)
+            elif timestamp_str:
+                timestamp = datetime.fromisoformat(timestamp_str)
+            else:
+                timestamp = datetime.now(_UTC)
         except (ValueError, AttributeError):
-            timestamp = datetime.now()
+            timestamp = datetime.now(_UTC)
 
         msg = Message(
             uuid=uuid,

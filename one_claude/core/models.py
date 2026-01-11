@@ -50,7 +50,7 @@ class ThinkingBlock:
     signature: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class Message:
     """A single message in a session."""
 
