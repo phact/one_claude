@@ -92,18 +92,64 @@ class TeleportSandbox:
         self._using_sandbox = self.mode in ("docker", "microvm")
         self._started = True
 
+    async def sync_back(self) -> dict[str, str]:
+        """Sync changed files back to the original project directory.
+
+        Returns:
+            Dict of synced files: {path: "new"|"modified"|"deleted"}
+        """
+        if not self._host_dir or not self.project_path:
+            return {}
+
+        synced: dict[str, str] = {}
+        project_dir = Path(self.project_path)
+
+        # The sandbox files are at _host_dir/<project_path stripped of leading />
+        sandbox_project = self._host_dir / self.project_path.lstrip("/")
+
+        if not sandbox_project.exists():
+            return {}
+
+        # Sync files from sandbox back to host
+        for sandbox_file in sandbox_project.rglob("*"):
+            if not sandbox_file.is_file():
+                continue
+
+            rel_path = sandbox_file.relative_to(sandbox_project)
+            host_file = project_dir / rel_path
+
+            try:
+                sandbox_content = sandbox_file.read_bytes()
+
+                if host_file.exists():
+                    host_content = host_file.read_bytes()
+                    if sandbox_content != host_content:
+                        # File was modified
+                        host_file.parent.mkdir(parents=True, exist_ok=True)
+                        host_file.write_bytes(sandbox_content)
+                        synced[str(rel_path)] = "modified"
+                else:
+                    # New file
+                    host_file.parent.mkdir(parents=True, exist_ok=True)
+                    host_file.write_bytes(sandbox_content)
+                    synced[str(rel_path)] = "new"
+            except (PermissionError, OSError):
+                continue
+
+        return synced
+
     async def stop(self) -> None:
         """Cleanup working directories."""
         self._started = False
         self._using_sandbox = False
 
-        # Cleanup host directory
+        # Cleanup host directory (ignore errors from Docker root-owned files)
         if self._host_dir and self._host_dir.exists():
-            shutil.rmtree(self._host_dir)
+            shutil.rmtree(self._host_dir, ignore_errors=True)
 
         # Cleanup claude directory
         if self._claude_dir and self._claude_dir.exists():
-            shutil.rmtree(self._claude_dir)
+            shutil.rmtree(self._claude_dir, ignore_errors=True)
 
     async def write_file(self, path: str, content: bytes) -> None:
         """Write file to working directory."""
@@ -222,5 +268,6 @@ class TeleportSandbox:
             claude_dir=self._claude_dir,
             project_path=self.project_path,
             image=self.image,
+            session_id=self.session_id,
             term=term,
         )

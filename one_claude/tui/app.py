@@ -8,7 +8,6 @@ from one_claude.config import Config
 from one_claude.core.scanner import ClaudeScanner
 from one_claude.teleport.sandbox import is_msb_available
 from one_claude.tui.screens.home import HomeScreen
-from one_claude.tui.screens.search import SearchScreen
 from one_claude.tui.screens.session import SessionScreen
 
 
@@ -133,8 +132,9 @@ class OneClaude(App):
         self.push_screen(HomeScreen(self.scanner))
 
     def action_search(self) -> None:
-        """Open search."""
-        self.push_screen(SearchScreen(self.scanner))
+        """Focus search on home screen."""
+        if isinstance(self.screen, HomeScreen):
+            self.screen.action_focus_search()
 
     def action_back(self) -> None:
         """Go back to previous screen."""

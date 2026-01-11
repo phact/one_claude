@@ -21,6 +21,7 @@ class TeleportExecutor(ABC):
         claude_dir: Path,
         project_path: str,
         image: str,
+        session_id: str,
         term: str | None = None,
     ) -> list[str]:
         """Get the command to run Claude in this execution mode.
@@ -30,6 +31,7 @@ class TeleportExecutor(ABC):
             claude_dir: Claude config directory (mounted to /root)
             project_path: Original project path (e.g., /tmp/test)
             image: Container image to use
+            session_id: Session ID to resume
             term: TERM environment variable
 
         Returns:
@@ -49,6 +51,15 @@ class LocalExecutor(TeleportExecutor):
     """Run claude directly in the original project directory."""
 
     name = "local"
+    _tmux_available: bool | None = None
+
+    def is_available(self) -> bool:
+        return True
+
+    def has_tmux(self) -> bool:
+        if self._tmux_available is None:
+            self._tmux_available = shutil.which("tmux") is not None
+        return self._tmux_available
 
     def get_command(
         self,
@@ -56,9 +67,28 @@ class LocalExecutor(TeleportExecutor):
         claude_dir: Path,
         project_path: str,
         image: str,
+        session_id: str,
         term: str | None = None,
     ) -> list[str]:
-        return ["bash", "-c", f"cd {project_path} && claude --continue"]
+        claude_cmd = f"claude --resume {session_id}"
+
+        # Fall back to direct claude if no tmux
+        if not self.has_tmux():
+            return ["bash", "-c", f"cd '{project_path}' && {claude_cmd}"]
+
+        # tmux with dual panes: claude on left, shell on right
+        # Kill any existing teleport session first
+        # Use send-keys to run tree in right pane after it starts
+        tmux_cmd = f"""
+tmux kill-session -t teleport 2>/dev/null
+tmux new-session -d -s teleport -c "{project_path}" "{claude_cmd}" \\; \
+    split-window -h -c "{project_path}" \\; \
+    send-keys "echo 'CMD: {claude_cmd}'" Enter \\; \
+    send-keys "tree -L 2 2>/dev/null || ls -la" Enter \\; \
+    select-pane -t 0 \\; \
+    attach-session -t teleport
+"""
+        return ["bash", "-c", tmux_cmd.strip()]
 
 
 class DockerExecutor(TeleportExecutor):
@@ -90,25 +120,34 @@ class DockerExecutor(TeleportExecutor):
         claude_dir: Path,
         project_path: str,
         image: str,
+        session_id: str,
         term: str | None = None,
     ) -> list[str]:
         inner_cwd = f"/workspace{project_path}"
 
-        cmd = [
-            "docker", "run",
-            "-it",  # Interactive TTY
-            "--rm",  # Clean up container after exit
-            "-v", f"{host_dir}:/workspace",
-            "-v", f"{claude_dir}:/root",
-            "-w", inner_cwd,
-            "-e", "HOME=/root",
-        ]
-
+        # Build docker run prefix
+        # Use --user to run as current user (not root) so --dangerously-skip-permissions works
+        docker_base = f"docker run -it --rm --user \\$(id -u):\\$(id -g) -v {host_dir}:/workspace -v {claude_dir}:/home/user -w {inner_cwd} -e HOME=/home/user"
         if term:
-            cmd.extend(["-e", f"TERM={term}"])
+            docker_base += f" -e TERM={term}"
 
-        cmd.extend([image, "claude", "--continue"])
-        return cmd
+        claude_cmd = f"{docker_base} --name teleport-claude {image} claude --resume {session_id} --dangerously-skip-permissions"
+        shell_cmd = f"{docker_base} --name teleport-shell {image} bash"
+
+        # tmux with dual panes: claude on left, shell on right
+        # Kill any existing teleport session and containers first
+        # Use send-keys to run tree in right pane after it starts
+        tmux_cmd = f"""
+tmux kill-session -t teleport 2>/dev/null
+docker rm -f teleport-claude teleport-shell 2>/dev/null
+tmux new-session -d -s teleport "{claude_cmd}" \\; \
+    split-window -h "{shell_cmd}" \\; \
+    send-keys "echo 'CMD: claude --resume {session_id} --dangerously-skip-permissions'" Enter \\; \
+    send-keys "tree -L 2 2>/dev/null || ls -la" Enter \\; \
+    select-pane -t 0 \\; \
+    attach-session -t teleport
+"""
+        return ["bash", "-c", tmux_cmd.strip()]
 
 
 class MicrovmExecutor(TeleportExecutor):
@@ -140,23 +179,31 @@ class MicrovmExecutor(TeleportExecutor):
         claude_dir: Path,
         project_path: str,
         image: str,
+        session_id: str,
         term: str | None = None,
     ) -> list[str]:
         inner_cwd = f"/workspace{project_path}"
 
-        cmd = [
-            "msb", "exe",
-            "-v", f"{host_dir}:/workspace",
-            "-v", f"{claude_dir}:/root",
-            "--workdir", inner_cwd,
-            "--env", "HOME=/root",
-        ]
-
+        # Build msb exe prefix
+        msb_prefix = f"msb exe -v {host_dir}:/workspace -v {claude_dir}:/root --workdir {inner_cwd} --env HOME=/root"
         if term:
-            cmd.extend(["--env", f"TERM={term}"])
+            msb_prefix += f" --env TERM={term}"
 
-        cmd.extend(["-e", "claude --continue", image])
-        return cmd
+        claude_cmd = f'{msb_prefix} -e "claude --resume {session_id} --permission-mode bypassPermissions" {image}'
+        shell_cmd = f"{msb_prefix} -e bash {image}"
+
+        # tmux with dual panes: claude on left, shell on right
+        # Kill any existing teleport session first
+        # Use send-keys to run tree in right pane after it starts
+        tmux_cmd = f"""
+tmux kill-session -t teleport 2>/dev/null
+tmux new-session -d -s teleport "{claude_cmd}" \\; \
+    split-window -h "{shell_cmd}" \\; \
+    send-keys "tree -L 2 2>/dev/null || ls -la" Enter \\; \
+    select-pane -t 0 \\; \
+    attach-session -t teleport
+"""
+        return ["bash", "-c", tmux_cmd.strip()]
 
 
 # Registry of available executors

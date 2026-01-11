@@ -1,4 +1,4 @@
-"""Home screen with session list."""
+"""Home screen with conversation list."""
 
 import asyncio
 import os
@@ -14,45 +14,62 @@ except ImportError:
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
-from one_claude.core.models import Project, Session
+from one_claude.core.models import ConversationPath, Project
 from one_claude.core.scanner import ClaudeScanner
 from one_claude.index.search import SearchEngine
 from one_claude.teleport.executors import get_mode_names
 
 
-class SessionListItem(ListItem):
-    """A single session item in the list."""
+class ConversationListItem(ListItem):
+    """A single conversation path item in the list."""
 
-    def __init__(self, session: Session):
+    def __init__(self, path: ConversationPath, is_match: bool = True):
         super().__init__()
-        self.session = session
+        self.path = path
+        self.is_match = is_match
+        # Add dimmed class for non-matching items during search
+        if not is_match:
+            self.add_class("dimmed")
 
     def compose(self) -> ComposeResult:
-        """Create the session item display."""
-        title = self.session.title or "Untitled"
-        session_id = self.session.id[:8]
-        checkpoint_str = f"  {self.session.checkpoint_count} cp" if self.session.checkpoint_count else ""
-        meta = f"{self._get_project_name()}  {self._format_time()}  {self.session.message_count} msgs{checkpoint_str}"
+        """Create the conversation item display."""
+        # Tree prefix + title
+        prefix = self.path.tree_prefix or ""
+        title = self.path.title or "Untitled"
+        display_title = f"{prefix}{title}"
+
+        # Last user message (truncated) for context
+        last_msg = self.path.last_user_message or ""
+
+        path_id = self.path.id[:8]
+        meta = f"{self._get_project_name()}  {self._format_time()}  {self.path.message_count} msgs"
+
+        # Add branch indicator if this path has siblings
+        if self.path.sibling_leaf_uuids:
+            branch_count = len(self.path.sibling_leaf_uuids) + 1
+            meta += f"  {branch_count} branches"
 
         with Horizontal(classes="session-row"):
-            yield Static(title, classes="session-title")
-            yield Static(session_id, classes="session-id")
+            yield Static(display_title, classes="session-title")
+            if last_msg:
+                yield Static(f"  {last_msg}", classes="session-last-msg")
+            yield Static(path_id, classes="session-id")
         yield Static(meta, classes="session-meta")
 
     def _get_project_name(self) -> str:
         """Get short project name."""
-        path = self.session.project_display
+        path = self.path.project_display
         parts = path.rstrip("/").split("/")
         return parts[-1] if parts else path
 
     def _format_time(self) -> str:
-        """Format the session time as relative."""
+        """Format the time as relative."""
         now = datetime.now()
-        updated = self.session.updated_at
+        updated = self.path.updated_at
 
         # Make both naive for comparison
         if updated.tzinfo is not None:
@@ -103,11 +120,17 @@ class ProjectListItem(ListItem):
 
 
 class HomeScreen(Screen):
-    """Home screen showing all sessions."""
+    """Home screen showing all conversation paths."""
 
     BINDINGS = [
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
+        Binding("g", "go_top_prefix", "Top", show=False),
+        Binding("G", "go_bottom", "Bottom", show=False),
+        Binding("ctrl+u", "page_up", "Page Up", show=False),
+        Binding("ctrl+d", "page_down", "Page Down", show=False),
+        Binding("ctrl+f", "page_down_full", "Page Down", show=False),
+        Binding("ctrl+b", "page_up_full", "Page Up", show=False),
         Binding("enter", "select", "Open"),
         Binding("/", "focus_search", "/ Search"),
         Binding("escape", "clear_search", "Clear", show=False),
@@ -144,27 +167,40 @@ class HomeScreen(Screen):
         padding: 0 2;
     }
 
-    SessionListItem {
+    ConversationListItem {
         width: 100%;
         height: auto;
     }
 
-    SessionListItem .session-row {
+    ConversationListItem .session-row {
         width: 100%;
         height: 1;
     }
 
-    SessionListItem .session-title {
+    ConversationListItem .session-title {
         width: 1fr;
     }
 
-    SessionListItem .session-id {
+    ConversationListItem .session-id {
         width: 9;
         color: $text-muted;
     }
 
-    SessionListItem .session-meta {
+    ConversationListItem .session-last-msg {
+        color: $text-muted;
+        max-width: 30;
+    }
+
+    ConversationListItem .session-meta {
         width: 100%;
+    }
+
+    ConversationListItem.dimmed {
+        opacity: 0.4;
+    }
+
+    ConversationListItem.dimmed .session-title {
+        color: $text-muted;
     }
     """
 
@@ -172,12 +208,14 @@ class HomeScreen(Screen):
         super().__init__()
         self.scanner = scanner
         self.search_engine = SearchEngine(scanner)
+        self.search_engine.start_preload()  # Background load message trees
         self.projects: list[Project] = []
-        self.sessions: list[Session] = []
-        self.all_sessions: list[Session] = []  # Unfiltered
+        self.paths: list[ConversationPath] = []
+        self.all_paths: list[ConversationPath] = []  # Unfiltered
         self.selected_project: Project | None = None
         self.search_query: str = ""
         self.teleport_mode: str = "docker"  # Default to docker
+        self._g_pressed: bool = False  # For gg command
 
     def compose(self) -> ComposeResult:
         """Create the home screen layout."""
@@ -189,20 +227,24 @@ class HomeScreen(Screen):
                 yield Label("Projects", id="projects-header")
                 yield ListView(id="project-list")
             with Vertical(classes="content"):
-                yield Label("Sessions", id="sessions-header")
+                yield Label("Conversations", id="sessions-header")
                 yield ListView(id="session-list")
 
         # Mode indicator at bottom right (markup=False to show literal brackets)
         yield Static(f"[m] {self.teleport_mode}", id="mode-indicator", markup=False)
 
     def on_mount(self) -> None:
-        """Load sessions on mount."""
-        self.refresh_sessions()
-        # Focus session list by default
+        """Load conversations on mount."""
+        self.refresh_conversations()
+        # Focus conversation list by default
         self.query_one("#session-list", ListView).focus()
 
-    def refresh_sessions(self) -> None:
-        """Refresh the session list."""
+        # Check for missing tools in local mode
+        self._check_local_tools()
+
+    def refresh_conversations(self) -> None:
+        """Refresh the conversation list."""
+        # Still need projects for the sidebar
         self.projects = self.scanner.scan_all()
 
         # Populate project list
@@ -212,92 +254,190 @@ class HomeScreen(Screen):
         for project in self.projects:
             project_list.append(ProjectListItem(project))
 
-        # Build all sessions list (excluding agent sessions)
-        self.all_sessions = []
-        for project in self.projects:
-            for session in project.sessions:
-                if not session.is_agent:
-                    self.all_sessions.append(session)
-        self.all_sessions.sort(key=lambda s: s.updated_at, reverse=True)
+        # Get conversation paths (uses tree cache from search engine preload)
+        tree_cache = self.search_engine._tree_cache
+        self.all_paths = self.scanner.scan_conversation_paths(tree_cache=tree_cache)
 
-        # Show sessions
-        self._update_session_list()
+        # Show conversations
+        self._update_conversation_list()
 
-    def _update_session_list(self) -> None:
-        """Update the session list based on selected project and search."""
+    def _update_conversation_list(self) -> None:
+        """Update the conversation list based on selected project and search."""
         session_list = self.query_one("#session-list", ListView)
         session_list.clear()
 
-        # Start with all or project-filtered sessions (excluding agents)
+        # Start with all or project-filtered paths
         if self.selected_project:
-            base_sessions = [s for s in self.selected_project.sessions if not s.is_agent]
+            base_paths = [
+                p for p in self.all_paths
+                if p.project_display == self.selected_project.display_path
+            ]
         else:
-            base_sessions = self.all_sessions
+            base_paths = self.all_paths
 
-        # Apply search filter
+        # Track which paths match the search (for highlighting)
+        matching_ids: set[str] = set()
+
         if self.search_query:
-            # Use SearchEngine for full-text search (titles + message content)
-            project_filter = self.selected_project.display_path if self.selected_project else None
-            results = self.search_engine.search(
-                self.search_query,
-                mode="text",
-                project_filter=project_filter,
-                limit=100,
-            )
-            # Extract sessions from results (already sorted by relevance)
-            self.sessions = [r.session for r in results]
-        else:
-            self.sessions = list(base_sessions)
+            query_lower = self.search_query.lower()
+            tree_cache = self.search_engine._tree_cache
 
-        for session in self.sessions:
-            session_list.append(SessionListItem(session))
+            for p in base_paths:
+                # Title match
+                if query_lower in p.title.lower():
+                    matching_ids.add(p.id)
+                    continue
+
+                # Content match - search messages in tree cache
+                for jsonl_file in p.jsonl_files:
+                    session_id = jsonl_file.stem
+                    tree = tree_cache.get(session_id)
+                    if tree:
+                        # Get the linear path for this conversation
+                        path_msgs = tree.get_linear_path(p.leaf_uuid)
+                        for msg in path_msgs:
+                            if msg.text_content and query_lower in msg.text_content.lower():
+                                matching_ids.add(p.id)
+                                break
+                        else:
+                            continue
+                        break
+
+        # Filter and display paths
+        if self.search_query:
+            # Group paths into trees (root + children)
+            trees: list[list[ConversationPath]] = []
+            current_tree: list[ConversationPath] = []
+
+            for path in base_paths:
+                # Root paths have no indent (empty or ● prefix)
+                is_root = path.tree_prefix in ("", "● ")
+
+                if is_root:
+                    if current_tree:
+                        trees.append(current_tree)
+                    current_tree = [path]
+                else:
+                    current_tree.append(path)
+
+            if current_tree:
+                trees.append(current_tree)
+
+            # Only show trees that have at least one match
+            self.paths = []
+            for tree in trees:
+                if any(p.id in matching_ids for p in tree):
+                    self.paths.extend(tree)
+        else:
+            self.paths = list(base_paths)
+
+        for path in self.paths:
+            # If searching, dim non-matching paths (but still show them if tree has a match)
+            is_match = not self.search_query or path.id in matching_ids
+            session_list.append(ConversationListItem(path, is_match=is_match))
 
         # Update header
         header = self.query_one("#sessions-header", Label)
-        count = len(self.sessions)
-        if self.selected_project:
+        count = len(self.paths)
+        if self.search_query:
+            match_count = len(matching_ids)
+            if self.selected_project:
+                name = self.selected_project.display_path.rstrip("/").split("/")[-1]
+                header.update(f"Conversations - {name} ({match_count}/{count} match)")
+            else:
+                header.update(f"Conversations ({match_count}/{count} match)")
+        elif self.selected_project:
             name = self.selected_project.display_path.rstrip("/").split("/")[-1]
-            header.update(f"Sessions - {name} ({count})")
+            header.update(f"Conversations - {name} ({count})")
         else:
-            header.update(f"Sessions ({count})")
+            header.update(f"Conversations ({count})")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Handle search input changes."""
         if event.input.id == "search-input":
             self.search_query = event.value
-            self._update_session_list()
+            self._update_conversation_list()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle search input submission (Enter)."""
         if event.input.id == "search-input":
-            # Focus the session list and select first item
+            # Focus the conversation list and select first item
             session_list = self.query_one("#session-list", ListView)
             session_list.focus()
-            if self.sessions:
+            if self.paths:
                 session_list.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle list selection."""
         if isinstance(event.item, ProjectListItem):
             self.selected_project = event.item.project
-            self._update_session_list()
-        elif isinstance(event.item, SessionListItem):
-            # Open session screen
+            self._update_conversation_list()
+        elif isinstance(event.item, ConversationListItem):
+            # Open session screen with conversation path
             from one_claude.tui.screens.session import SessionScreen
 
-            self.app.push_screen(SessionScreen(event.item.session, self.scanner))
+            self.app.push_screen(SessionScreen(event.item.path, self.scanner))
 
     def action_cursor_down(self) -> None:
         """Move cursor down."""
+        self._g_pressed = False
         focused = self.focused
         if isinstance(focused, ListView):
             focused.action_cursor_down()
 
     def action_cursor_up(self) -> None:
         """Move cursor up."""
+        self._g_pressed = False
         focused = self.focused
         if isinstance(focused, ListView):
             focused.action_cursor_up()
+
+    def action_go_top_prefix(self) -> None:
+        """Handle g key - go to top on gg."""
+        if self._g_pressed:
+            # gg - go to top
+            self._g_pressed = False
+            focused = self.focused
+            if isinstance(focused, ListView):
+                focused.index = 0
+        else:
+            self._g_pressed = True
+
+    def action_go_bottom(self) -> None:
+        """Go to bottom of list (G)."""
+        self._g_pressed = False
+        focused = self.focused
+        if isinstance(focused, ListView) and focused.children:
+            focused.index = len(focused.children) - 1
+
+    def action_page_up(self) -> None:
+        """Page up half screen (ctrl+u)."""
+        self._g_pressed = False
+        focused = self.focused
+        if isinstance(focused, ListView):
+            # Move up ~10 items (half page)
+            focused.index = max(0, (focused.index or 0) - 10)
+
+    def action_page_down(self) -> None:
+        """Page down half screen (ctrl+d)."""
+        self._g_pressed = False
+        focused = self.focused
+        if isinstance(focused, ListView) and focused.children:
+            focused.index = min(len(focused.children) - 1, (focused.index or 0) + 10)
+
+    def action_page_up_full(self) -> None:
+        """Page up full screen (ctrl+b)."""
+        self._g_pressed = False
+        focused = self.focused
+        if isinstance(focused, ListView):
+            focused.index = max(0, (focused.index or 0) - 20)
+
+    def action_page_down_full(self) -> None:
+        """Page down full screen (ctrl+f)."""
+        self._g_pressed = False
+        focused = self.focused
+        if isinstance(focused, ListView) and focused.children:
+            focused.index = min(len(focused.children) - 1, (focused.index or 0) + 20)
 
     def action_select(self) -> None:
         """Select current item."""
@@ -306,7 +446,7 @@ class HomeScreen(Screen):
             focused.action_select_cursor()
 
     def action_switch_focus(self) -> None:
-        """Switch focus between project and session list."""
+        """Switch focus between project and conversation list."""
         project_list = self.query_one("#project-list", ListView)
         session_list = self.query_one("#session-list", ListView)
 
@@ -326,23 +466,74 @@ class HomeScreen(Screen):
         if search_input.has_focus:
             search_input.value = ""
             self.search_query = ""
-            self._update_session_list()
+            self._update_conversation_list()
             self.query_one("#session-list", ListView).focus()
+        elif self.search_query:
+            # Clear search from session list
+            search_input.value = ""
+            self.search_query = ""
+            self._update_conversation_list()
 
-    def action_copy_session_id(self) -> None:
-        """Copy selected session ID to clipboard."""
-        session_list = self.query_one("#session-list", ListView)
-        if session_list.index is not None and session_list.index < len(self.sessions):
-            session = self.sessions[session_list.index]
-            if pyperclip:
+    def _copy_to_clipboard(self, text: str) -> tuple[bool, str]:
+        """Copy text to clipboard. Returns (success, error_hint)."""
+        # macOS: pbcopy
+        if sys.platform == "darwin":
+            if shutil.which("pbcopy"):
                 try:
-                    pyperclip.copy(session.id)
-                    self.app.notify(f"Copied: {session.id[:8]}...")
-                    return
+                    subprocess.run(["pbcopy"], input=text.encode(), check=True)
+                    return True, ""
                 except Exception:
                     pass
-            # Fallback: just show the ID
-            self.app.notify(f"ID: {session.id}")
+            return False, "pbcopy not found (should be built-in)"
+
+        # Linux: try wl-copy (Wayland) then xclip (X11)
+        if shutil.which("wl-copy"):
+            try:
+                subprocess.run(["wl-copy", text], check=True)
+                return True, ""
+            except Exception:
+                pass
+
+        if shutil.which("xclip"):
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text.encode(),
+                    check=True,
+                )
+                return True, ""
+            except Exception:
+                pass
+
+        # Try pyperclip as last resort
+        if pyperclip:
+            try:
+                pyperclip.copy(text)
+                return True, ""
+            except Exception:
+                pass
+
+        # Suggest install based on environment
+        if os.environ.get("WAYLAND_DISPLAY"):
+            return False, "install wl-clipboard"
+        else:
+            return False, "install xclip"
+
+    def action_copy_session_id(self) -> None:
+        """Copy selected conversation ID to clipboard."""
+        session_list = self.query_one("#session-list", ListView)
+        if session_list.index is not None and session_list.index < len(self.paths):
+            path = self.paths[session_list.index]
+            success, hint = self._copy_to_clipboard(path.id)
+            if success:
+                self.app.notify(f"Copied: {path.id[:8]}...")
+            else:
+                self.app.notify(f"{path.id} ({hint})")
+
+    def _check_local_tools(self) -> None:
+        """Check for missing tools and notify user."""
+        if not shutil.which("tmux"):
+            self.app.notify("Local mode: tmux not found, will run claude directly", severity="warning")
 
     def action_toggle_mode(self) -> None:
         """Toggle between teleport modes."""
@@ -354,32 +545,43 @@ class HomeScreen(Screen):
         # Update the indicator
         indicator = self.query_one("#mode-indicator", Static)
         indicator.update(f"[m] {self.teleport_mode}")
-        self.app.notify(f"Teleport mode: {self.teleport_mode}")
 
     def action_teleport(self) -> None:
-        """Teleport to the latest message of selected session."""
+        """Teleport to the selected conversation."""
         session_list = self.query_one("#session-list", ListView)
-        if session_list.index is not None and session_list.index < len(self.sessions):
-            session = self.sessions[session_list.index]
-            asyncio.create_task(self._do_teleport(session))
+        if session_list.index is not None and session_list.index < len(self.paths):
+            path = self.paths[session_list.index]
+            asyncio.create_task(self._do_teleport(path))
         else:
-            self.app.notify("Select a session first")
+            self.app.notify("Select a conversation first")
 
-    async def _do_teleport(self, session) -> None:
-        """Execute teleport to latest message of session."""
+    async def _do_teleport(self, path: ConversationPath) -> None:
+        """Execute teleport to a conversation path."""
         from one_claude.teleport.restore import FileRestorer
 
         mode_str = self.teleport_mode
-        self.app.notify(f"Teleporting to {session.id[:8]} ({mode_str})...")
+        self.app.notify(f"Teleporting to {path.id[:8]} ({mode_str})...")
 
         try:
             restorer = FileRestorer(self.scanner)
 
-            # Teleport to latest (no message_uuid = latest)
+            # Need to get a Session object for the restorer
+            # Use the newest JSONL file in the chain
+            if path.jsonl_files:
+                session_id = path.jsonl_files[-1].stem
+                session = self.scanner.get_session_by_id(session_id)
+                if not session:
+                    self.app.notify("Session not found", severity="error")
+                    return
+            else:
+                self.app.notify("No JSONL files in path", severity="error")
+                return
+
+            # Teleport to the leaf message
             teleport_session = await restorer.restore_to_sandbox(
                 session,
-                message_uuid=None,  # Latest
-                mode=mode_str,  # local, docker, or microvm
+                message_uuid=path.leaf_uuid,
+                mode=mode_str,
             )
 
             files_count = len(teleport_session.files_restored)
@@ -397,8 +599,8 @@ class HomeScreen(Screen):
                     columns=term_size.columns,
                 )
 
-                sys.stderr.write(f"\n🚀 Teleporting to {session.title or session.id[:8]} [{mode_str}]...\n")
-                sys.stderr.write(f"   Project: {session.project_display}\n")
+                sys.stderr.write(f"\n🚀 Teleporting to {path.title or path.id[:8]} [{mode_str}]...\n")
+                sys.stderr.write(f"   Project: {path.project_display}\n")
                 sys.stderr.write(f"   Files restored: {files_count}\n")
                 sys.stderr.write(f"   Terminal: {term_size.columns}x{term_size.lines} ({term})\n\n")
                 sys.stderr.flush()

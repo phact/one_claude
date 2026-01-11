@@ -5,6 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Install everything in a single layer
 RUN apt-get update && apt-get install -y \
     tmux \
+    tree \
     curl \
     git \
     vim \

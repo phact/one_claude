@@ -1,13 +1,39 @@
 """Search functionality for one_claude."""
 
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from one_claude.core.models import Message, MessageType, Project, Session
+import stringzilla as sz
+
+from one_claude.core.models import Message, MessageTree, MessageType, Project, Session
 from one_claude.core.scanner import ClaudeScanner
+
+
+def _sz_fold(text: str) -> bytes:
+    """Case-fold text for case-insensitive matching."""
+    return sz.utf8_case_fold(text)
+
+
+def _sz_find_folded(text_folded: bytes, query_folded: bytes) -> int:
+    """Find in already-folded text. Returns -1 if not found."""
+    result = sz.find(text_folded, query_folded)
+    return -1 if result is None else result
+
+
+def _sz_count_folded(text_folded: bytes, query_folded: bytes) -> int:
+    """Count in already-folded text."""
+    return sz.count(text_folded, query_folded)
+
+
+def _sz_find(text: str, query: str) -> int:
+    """Case-insensitive find using stringzilla. Returns -1 if not found."""
+    text_folded = _sz_fold(text)
+    query_folded = _sz_fold(query)
+    return _sz_find_folded(text_folded, query_folded)
 
 
 @dataclass
@@ -32,6 +58,55 @@ class SearchEngine:
         self._last_cache_time: datetime | None = None
         self._embedder = None
         self._vector_store = None
+        # Message tree cache for fast search
+        self._tree_cache: dict[str, MessageTree] = {}
+        self._tree_cache_lock = threading.Lock()
+        self._preload_thread: threading.Thread | None = None
+        self._preload_complete = False
+
+    def start_preload(self) -> None:
+        """Start background pre-loading of message trees."""
+        if self._preload_thread is not None:
+            return  # Already running or completed
+
+        self._preload_thread = threading.Thread(target=self._preload_trees, daemon=True)
+        self._preload_thread.start()
+
+    def _preload_trees(self) -> None:
+        """Pre-load all message trees in background."""
+        sessions = self._get_sessions()
+        for session in sessions:
+            if session.id in self._tree_cache:
+                continue
+            try:
+                tree = self.scanner.load_session_messages(session)
+                with self._tree_cache_lock:
+                    self._tree_cache[session.id] = tree
+            except Exception:
+                pass
+        self._preload_complete = True
+
+    def _get_tree(self, session: Session) -> MessageTree | None:
+        """Get message tree, from cache if available."""
+        with self._tree_cache_lock:
+            if session.id in self._tree_cache:
+                return self._tree_cache[session.id]
+
+        # Not cached, load it
+        try:
+            tree = self.scanner.load_session_messages(session)
+            with self._tree_cache_lock:
+                self._tree_cache[session.id] = tree
+            return tree
+        except Exception:
+            return None
+
+    @property
+    def preload_progress(self) -> tuple[int, int]:
+        """Return (cached_count, total_sessions) for progress tracking."""
+        sessions = self._get_sessions()
+        with self._tree_cache_lock:
+            return len(self._tree_cache), len(sessions)
 
     def _get_sessions(self, force_refresh: bool = False) -> list[Session]:
         """Get all sessions, with caching."""
@@ -72,8 +147,8 @@ class SearchEngine:
             sessions = [
                 s
                 for s in sessions
-                if project_filter.lower() in s.project_display.lower()
-                or project_filter.lower() in s.project_path.lower()
+                if _sz_find(s.project_display, project_filter) >= 0
+                or _sz_find(s.project_path, project_filter) >= 0
             ]
 
         results: list[SearchResult] = []
@@ -106,32 +181,29 @@ class SearchEngine:
     def _search_titles(
         self, query: str, sessions: list[Session], limit: int
     ) -> list[SearchResult]:
-        """Search session titles."""
+        """Search session titles using stringzilla for speed."""
         results = []
-        query_lower = query.lower()
-        query_words = query_lower.split()
+        query_words = query.split()
 
         for session in sessions:
             title = session.title or ""
-            title_lower = title.lower()
 
             # Calculate match score
             score = 0.0
 
-            # Exact match
-            if query_lower in title_lower:
+            # Exact match (case-insensitive)
+            start = _sz_find(title, query)
+            if start >= 0:
                 score = 1.0
-                # Find match positions
-                start = title_lower.find(query_lower)
                 matches = [(start, start + len(query))]
             else:
                 # Word match
                 matches = []
                 for word in query_words:
-                    if word in title_lower:
+                    pos = _sz_find(title, word)
+                    if pos >= 0:
                         score += 0.3
-                        start = title_lower.find(word)
-                        matches.append((start, start + len(word)))
+                        matches.append((pos, pos + len(word)))
 
             if score > 0:
                 results.append(
@@ -149,50 +221,49 @@ class SearchEngine:
     def _search_content(
         self, query: str, sessions: list[Session], limit: int
     ) -> list[SearchResult]:
-        """Search session content (messages)."""
+        """Search session content (messages) using stringzilla for speed."""
         results = []
-        query_lower = query.lower()
+        query_folded = _sz_fold(query)
 
         for session in sessions:
-            try:
-                tree = self.scanner.load_session_messages(session)
-                messages = tree.get_main_thread()
-
-                best_match: SearchResult | None = None
-                total_matches = 0
-
-                for msg in messages:
-                    if msg.type not in (MessageType.USER, MessageType.ASSISTANT):
-                        continue
-
-                    content = msg.text_content.lower()
-                    if query_lower in content:
-                        total_matches += content.count(query_lower)
-
-                        # Find best snippet
-                        idx = content.find(query_lower)
-                        start = max(0, idx - 40)
-                        end = min(len(msg.text_content), idx + len(query) + 40)
-                        snippet = msg.text_content[start:end]
-                        if start > 0:
-                            snippet = "..." + snippet
-                        if end < len(msg.text_content):
-                            snippet = snippet + "..."
-
-                        if best_match is None or total_matches > best_match.score:
-                            best_match = SearchResult(
-                                session=session,
-                                message=msg,
-                                score=total_matches,
-                                match_type="text",
-                                snippet=snippet,
-                            )
-
-                if best_match:
-                    results.append(best_match)
-
-            except Exception:
+            tree = self._get_tree(session)
+            if tree is None:
                 continue
+
+            messages = tree.all_messages()  # All messages chronologically
+            best_match: SearchResult | None = None
+            total_matches = 0
+
+            for msg in messages:
+                if msg.type not in (MessageType.USER, MessageType.ASSISTANT):
+                    continue
+
+                content = msg.text_content
+                content_folded = _sz_fold(content)
+                idx = _sz_find_folded(content_folded, query_folded)
+                if idx >= 0:
+                    total_matches += _sz_count_folded(content_folded, query_folded)
+
+                    # Find best snippet
+                    start = max(0, idx - 40)
+                    end = min(len(content), idx + len(query) + 40)
+                    snippet = content[start:end]
+                    if start > 0:
+                        snippet = "..." + snippet
+                    if end < len(content):
+                        snippet = snippet + "..."
+
+                    if best_match is None or total_matches > best_match.score:
+                        best_match = SearchResult(
+                            session=session,
+                            message=msg,
+                            score=total_matches,
+                            match_type="text",
+                            snippet=snippet,
+                        )
+
+            if best_match:
+                results.append(best_match)
 
         return results
 
@@ -210,34 +281,32 @@ class SearchEngine:
             return []
 
         for session in sessions:
-            try:
-                tree = self.scanner.load_session_messages(session)
-                messages = tree.get_main_thread()
-
-                for msg in messages:
-                    if msg.type not in (MessageType.USER, MessageType.ASSISTANT):
-                        continue
-
-                    match = regex.search(msg.text_content)
-                    if match:
-                        start = max(0, match.start() - 30)
-                        end = min(len(msg.text_content), match.end() + 30)
-                        snippet = msg.text_content[start:end]
-
-                        results.append(
-                            SearchResult(
-                                session=session,
-                                message=msg,
-                                score=1.0,
-                                match_type="regex",
-                                snippet=snippet,
-                                matches=[(match.start() - start, match.end() - start)],
-                            )
-                        )
-                        break  # One result per session
-
-            except Exception:
+            tree = self._get_tree(session)
+            if tree is None:
                 continue
+
+            messages = tree.all_messages()  # All messages chronologically
+            for msg in messages:
+                if msg.type not in (MessageType.USER, MessageType.ASSISTANT):
+                    continue
+
+                match = regex.search(msg.text_content)
+                if match:
+                    start = max(0, match.start() - 30)
+                    end = min(len(msg.text_content), match.end() + 30)
+                    snippet = msg.text_content[start:end]
+
+                    results.append(
+                        SearchResult(
+                            session=session,
+                            message=msg,
+                            score=1.0,
+                            match_type="regex",
+                            snippet=snippet,
+                            matches=[(match.start() - start, match.end() - start)],
+                        )
+                    )
+                    break  # One result per session
 
             if len(results) >= limit:
                 break
@@ -318,8 +387,8 @@ class SearchEngine:
             # Apply project filter
             if project_filter:
                 if (
-                    project_filter.lower() not in session.project_display.lower()
-                    and project_filter.lower() not in session.project_path.lower()
+                    _sz_find(session.project_display, project_filter) < 0
+                    and _sz_find(session.project_path, project_filter) < 0
                 ):
                     continue
 

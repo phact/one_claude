@@ -201,6 +201,8 @@ class FileRestorer:
             message_uuid: Message to restore to (latest if None)
             mode: Execution mode - "local", "docker", or "microvm"
         """
+        import shutil
+
         # Create sandbox with project path (use display path for actual filesystem path)
         sandbox = TeleportSandbox(
             session_id=session.id,
@@ -209,46 +211,64 @@ class FileRestorer:
         )
         await sandbox.start()
 
-        # Get file checkpoints and path mapping
-        checkpoints = self.file_history.get_checkpoints_for_session(session.id)
-        path_mapping = self.build_path_mapping(session)
-
         files_restored: dict[str, str] = {}
+        is_latest = not message_uuid or message_uuid == ""
 
-        # Restore each file (latest version available)
-        for path_hash, versions in checkpoints.items():
-            if not versions:
-                continue
+        # For sandbox modes (docker/microvm), copy project directory
+        # Local mode runs in-place so doesn't need copying
+        if mode != "local":
+            project_dir = Path(session.project_display)
+            if project_dir.exists() and project_dir.is_dir():
+                # Copy all project files to sandbox workspace
+                for item in project_dir.rglob("*"):
+                    if item.is_file():
+                        rel_path = item.relative_to(project_dir)
+                        try:
+                            content = item.read_bytes()
+                            abs_path = str(project_dir / rel_path)
+                            await sandbox.write_file(abs_path, content)
+                            files_restored[abs_path] = "original"
+                        except (PermissionError, OSError):
+                            continue
 
-            # Use latest version (versions are sorted by version number)
-            # TODO: Filter by target timestamp if we add mtime to FileCheckpoint
-            applicable_version = versions[-1] if versions else None
+        # If rewinding (not latest), apply checkpoint file states
+        if not is_latest:
+            checkpoints = self.file_history.get_checkpoints_for_session(session.id)
+            path_mapping = self.build_path_mapping(session)
 
-            if not applicable_version:
-                continue
+            for path_hash, versions in checkpoints.items():
+                if not versions:
+                    continue
 
-            # Resolve original path
-            original_path = path_mapping.get(path_hash)
-            if not original_path:
-                continue
+                # Use latest version (versions are sorted by version number)
+                # TODO: Filter by target timestamp if we add mtime to FileCheckpoint
+                applicable_version = versions[-1] if versions else None
 
-            # Read checkpoint content
-            try:
-                content = applicable_version.read_content()
-            except Exception:
-                continue
+                if not applicable_version:
+                    continue
 
-            # Write to sandbox at the original absolute path location
-            # The workspace is mounted at /workspace, and we preserve the full path
-            await sandbox.write_file(original_path, content)
-            files_restored[original_path] = path_hash
+                # Resolve original path
+                original_path = path_mapping.get(path_hash)
+                if not original_path:
+                    continue
+
+                # Read checkpoint content
+                try:
+                    content = applicable_version.read_content()
+                except Exception:
+                    continue
+
+                # Overwrite with checkpoint version
+                await sandbox.write_file(original_path, content)
+                files_restored[original_path] = path_hash
 
         # Setup claude config directory
         source_claude_dir = self.scanner.claude_dir
         # Inside sandbox, CWD is /workspace/<original-path>, so Claude will look for
         # projects/-workspace-<original-path>/. We need to match that.
+        # Claude escapes both / and _ as - in project directory names.
         sandbox_project_path = f"/workspace{session.project_display}"
-        project_dir_name = sandbox_project_path.replace("/", "-")
+        project_dir_name = sandbox_project_path.replace("/", "-").replace("_", "-")
 
         # Create truncated JSONL
         jsonl_content = self._truncate_jsonl_to_message(

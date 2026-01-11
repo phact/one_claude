@@ -16,24 +16,32 @@ from textual.message import Message as TextualMessage
 from textual.screen import Screen
 from textual.widgets import Collapsible, Input, Label, Static
 
-from one_claude.core.models import Message, MessageType, Session
+from one_claude.core.models import ConversationPath, Message, MessageTree, MessageType
 from one_claude.core.scanner import ClaudeScanner
 
 
-class CheckpointSelected(TextualMessage):
-    """Message sent when a checkpoint is clicked."""
+class MessageClicked(TextualMessage):
+    """Message sent when a message widget is clicked."""
 
-    def __init__(self, checkpoint: Message) -> None:
-        self.checkpoint = checkpoint
+    def __init__(self, message: Message) -> None:
+        self.message = message
         super().__init__()
 
 
 class MessageWidget(Static):
     """Widget displaying a single message."""
 
-    def __init__(self, message: Message, show_thinking: bool = False):
+    def __init__(
+        self,
+        message: Message,
+        turn_number: int = 0,
+        show_thinking: bool = False,
+        has_branch: bool = False,  # True if there's a branch at this point
+    ):
         self.message = message
+        self.turn_number = turn_number
         self.show_thinking = show_thinking
+        self.has_branch = has_branch
 
         # Determine CSS class based on message type
         if message.type == MessageType.USER:
@@ -44,6 +52,8 @@ class MessageWidget(Static):
             classes = "message-container message-summary"
         elif message.type == MessageType.FILE_HISTORY_SNAPSHOT:
             classes = "message-container message-checkpoint"
+        elif message.type == MessageType.SYSTEM:
+            classes = "message-container message-system"
         else:
             classes = "message-container"
 
@@ -51,9 +61,7 @@ class MessageWidget(Static):
 
     def on_click(self) -> None:
         """Handle click on message widget."""
-        if self.message.type == MessageType.FILE_HISTORY_SNAPSHOT:
-            # Notify parent screen of checkpoint selection
-            self.post_message(CheckpointSelected(self.message))
+        self.post_message(MessageClicked(self.message))
 
     def compose(self) -> ComposeResult:
         """Compose the message display."""
@@ -67,9 +75,11 @@ class MessageWidget(Static):
         elif self.message.type == MessageType.ASSISTANT:
             yield from self._render_assistant_content()
         elif self.message.type == MessageType.SUMMARY:
-            yield Static(self.message.summary_text or "", classes="message-content")
+            yield Static(self.message.summary_text or "", classes="message-content", markup=False)
         elif self.message.type == MessageType.FILE_HISTORY_SNAPSHOT:
             yield from self._render_checkpoint_content()
+        elif self.message.type == MessageType.SYSTEM:
+            yield from self._render_system_content()
 
     def _build_header(self) -> str:
         """Build the message header."""
@@ -85,11 +95,19 @@ class MessageWidget(Static):
             label = "SUMMARY"
         elif self.message.type == MessageType.FILE_HISTORY_SNAPSHOT:
             label = "CHECKPOINT"
+        elif self.message.type == MessageType.SYSTEM:
+            label = "SYSTEM"
+            if self.message.system_subtype:
+                label += f" ({self.message.system_subtype})"
         else:
             label = self.message.type.value.upper()
 
         time_str = self._format_time()
-        return f"{label}  {time_str}"
+
+        # Branch indicator
+        branch_indicator = "  branch exists [b] ↱" if self.has_branch else ""
+
+        return f"#{self.turn_number}  {label}  {time_str}{branch_indicator}"
 
     def _format_time(self) -> str:
         """Format timestamp with h/m/d breakdown."""
@@ -135,23 +153,22 @@ class MessageWidget(Static):
             if len(result.content) > 500:
                 content += "\n... (truncated)"
 
-        return Static(content, classes="message-content")
+        return Static(content, classes="message-content", markup=False)
 
     def _render_assistant_content(self) -> ComposeResult:
         """Render assistant message content."""
         # Text content
         if self.message.text_content:
-            yield Static(self.message.text_content, classes="message-content")
+            yield Static(self.message.text_content, classes="message-content", markup=False)
 
         # Tool uses
         for tool_use in self.message.tool_uses:
             tool_display = self._format_tool_use(tool_use)
-            yield Static(tool_display, classes="tool-use")
+            yield Static(tool_display, classes="tool-use", markup=False)
 
         # Thinking (if enabled)
         if self.show_thinking and self.message.thinking:
-            thinking_text = f"Thinking: {self.message.thinking.content[:200]}..."
-            yield Static(thinking_text, classes="thinking")
+            yield Static(self.message.thinking.content, classes="thinking", markup=False)
 
     def _render_checkpoint_content(self) -> ComposeResult:
         """Render file history checkpoint content."""
@@ -172,6 +189,19 @@ class MessageWidget(Static):
                 yield Static("Checkpoint saved", classes="checkpoint-info")
         else:
             yield Static("Checkpoint saved", classes="checkpoint-info")
+
+    def _render_system_content(self) -> ComposeResult:
+        """Render system message content."""
+        data = self.message.system_data or {}
+        hook_count = data.get("hookCount", 0)
+        hook_errors = data.get("hookErrors", [])
+
+        if hook_count:
+            yield Static(f"{hook_count} hook(s) executed", classes="system-info")
+
+        if hook_errors:
+            for err in hook_errors:
+                yield Static(f"Hook error: {err}", classes="system-error")
 
     def _format_tool_use(self, tool_use) -> str:
         """Format a tool use for display."""
@@ -205,12 +235,12 @@ class MessageWidget(Static):
 
 
 class SessionScreen(Screen):
-    """Screen showing session details and conversation."""
+    """Screen showing conversation path details."""
 
     BINDINGS = [
         Binding("escape", "cancel_or_back", "Back"),
-        Binding("j", "scroll_down", "Down", show=False),
-        Binding("k", "scroll_up", "Up", show=False),
+        Binding("j", "next_message", "Down", show=False),
+        Binding("k", "prev_message", "Up", show=False),
         Binding("ctrl+f", "page_down", "Page Down", show=False),
         Binding("ctrl+u", "page_up", "Page Up", show=False),
         Binding("g", "scroll_top", "Top", show=False),
@@ -222,6 +252,8 @@ class SessionScreen(Screen):
         Binding("tab", "next_checkpoint", "Tab Next CP"),
         Binding("shift+tab", "prev_checkpoint", "S-Tab Prev CP", show=False),
         Binding("c", "copy_session_id", "Copy ID"),
+        Binding("s", "toggle_system", "Toggle System"),
+        Binding("b", "switch_branch", "[b]ranch"),
     ]
 
     DEFAULT_CSS = """
@@ -239,6 +271,14 @@ class SessionScreen(Screen):
         color: $text-muted;
     }
 
+    SessionScreen .message-user {
+        background: $surface;
+    }
+
+    SessionScreen .message-assistant {
+        background: $surface-darken-1;
+    }
+
     SessionScreen .message-summary {
         background: $warning-muted;
         border: solid $warning;
@@ -249,17 +289,27 @@ class SessionScreen(Screen):
         border: solid $success;
     }
 
-    SessionScreen .message-checkpoint:hover {
-        background: $success;
-    }
-
-    SessionScreen .message-checkpoint.selected {
-        background: $success;
-        border: double $success;
-    }
-
     SessionScreen .checkpoint-info {
         color: $success;
+    }
+
+    SessionScreen .message-system {
+        background: $surface-darken-2;
+        border: dashed gray;
+    }
+
+    SessionScreen .system-info {
+        color: $text-muted;
+        text-style: italic;
+    }
+
+    SessionScreen .system-error {
+        color: $error;
+    }
+
+    SessionScreen .thinking {
+        text-style: italic;
+        color: $text-muted;
     }
 
     SessionScreen #search-input {
@@ -275,29 +325,30 @@ class SessionScreen(Screen):
     SessionScreen .search-match {
         background: $warning;
     }
-
-    SessionScreen .agent-session {
-        margin-left: 2;
-        padding: 0 1;
-    }
-
-    SessionScreen .agent-title {
-        color: $text-muted;
-    }
     """
 
-    def __init__(self, session: Session, scanner: ClaudeScanner):
+    def __init__(self, path: ConversationPath, scanner: ClaudeScanner):
         super().__init__()
-        self.session = session
+        self.path = path
         self.scanner = scanner
         self.displayed_count: int = 0
         self.search_query: str = ""
         self.match_widgets: list[MessageWidget] = []
         self.current_match_index: int = -1
-        self.selected_checkpoint: Message | None = None
-        self.selected_checkpoint_widget: MessageWidget | None = None
+        # All message widgets and selection
+        self.message_widgets: list[MessageWidget] = []
+        self.selected_message: Message | None = None
+        self.selected_message_widget: MessageWidget | None = None
+        self.current_message_index: int = -1
+        # Checkpoint navigation (subset of messages)
         self.checkpoint_widgets: list[MessageWidget] = []
         self.current_checkpoint_index: int = -1
+        # Toggle for showing system messages (hidden by default)
+        self.show_system: bool = False
+        # Message tree for fork detection
+        self._message_tree: MessageTree | None = None
+        # Fork point UUIDs in this path (for branch indicator)
+        self._fork_points: set[str] = set()
 
     def compose(self) -> ComposeResult:
         """Create the session screen layout."""
@@ -307,30 +358,18 @@ class SessionScreen(Screen):
         # Header with session info and ID
         with Horizontal(id="session-header-row"):
             yield Static(
-                f" {self.session.title or 'Untitled Session'}",
+                f" {self.path.title or 'Untitled'}",
                 id="session-title",
+                markup=False,
             )
             yield Static(
-                self.session.id[:8],
+                self.path.id[:8],
                 id="session-id",
             )
         yield Static(
-            f"  {self.session.project_display}",
+            f"  {self.path.project_display}",
             id="session-meta",
         )
-
-        # Agent sessions (if any)
-        if self.session.child_agent_ids:
-            agent_count = len(self.session.child_agent_ids)
-            with Collapsible(title=f"Subagents ({agent_count})", collapsed=True, id="agents-collapsible"):
-                for agent_id in self.session.child_agent_ids:
-                    agent_session = self.scanner.get_session_by_id(agent_id)
-                    if agent_session:
-                        short_id = agent_id.replace("agent-", "")[:7]
-                        title = agent_session.title or "Untitled"
-                        if len(title) > 60:
-                            title = title[:57] + "..."
-                        yield Static(f"  {short_id}: {title}", classes="agent-session agent-title")
 
         # Message list
         yield ScrollableContainer(id="message-container")
@@ -348,44 +387,61 @@ class SessionScreen(Screen):
         """Load and display messages."""
         container = self.query_one("#message-container", ScrollableContainer)
 
-        # Load the message tree
-        message_tree = self.scanner.load_session_messages(self.session)
+        # Load messages and tree together (avoid double-parsing)
+        messages, tree = self.scanner.load_conversation_path_with_tree(self.path)
 
-        # Get ALL messages chronologically (includes summaries and compacted chains)
-        all_messages = message_tree.all_messages()
+        # Detect fork points if we have a tree
+        if tree is not None:
+            self._message_tree = tree
+            # Find all fork points along this path
+            self._fork_points = set()
+            for msg in messages:
+                if tree.is_fork_point(msg.uuid):
+                    self._fork_points.add(msg.uuid)
 
-        # Filter to displayable messages
-        display_types = (MessageType.USER, MessageType.ASSISTANT, MessageType.SUMMARY, MessageType.FILE_HISTORY_SNAPSHOT)
-        display_messages = [msg for msg in all_messages if msg.type in display_types]
+        # Filter to displayable message types
+        display_types = [MessageType.USER, MessageType.ASSISTANT, MessageType.SUMMARY, MessageType.FILE_HISTORY_SNAPSHOT]
+        if self.show_system:
+            display_types.append(MessageType.SYSTEM)
+        display_messages = [m for m in messages if m.type in display_types]
 
-        # Count checkpoints in displayed messages
+        # Count checkpoints
         checkpoint_count = sum(1 for m in display_messages if m.type == MessageType.FILE_HISTORY_SNAPSHOT)
 
-        # Update header with actual count
+        # Update header with info
         self.displayed_count = len(display_messages)
         meta = self.query_one("#session-meta", Static)
+        branch_str = ""
+        if self.path.sibling_leaf_uuids:
+            branch_count = len(self.path.sibling_leaf_uuids) + 1
+            branch_str = f"  {branch_count} branches"
         cp_str = f"  {checkpoint_count} checkpoints" if checkpoint_count else ""
-        meta.update(f"  {self.session.project_display}  {self.displayed_count} messages{cp_str}")
+        meta.update(f"  {self.path.project_display}  {self.displayed_count} messages{branch_str}{cp_str}")
 
-        # Create message widgets and track checkpoints
+        # Create message widgets and track all + checkpoints
+        self.message_widgets = []
         self.checkpoint_widgets = []
-        for msg in display_messages:
-            widget = MessageWidget(msg, show_thinking=False)
+        for i, msg in enumerate(display_messages, start=1):
+            has_branch = msg.uuid in self._fork_points
+            widget = MessageWidget(
+                msg,
+                turn_number=i,
+                show_thinking=True,
+                has_branch=has_branch,
+            )
             container.mount(widget)
+            self.message_widgets.append(widget)
             if msg.type == MessageType.FILE_HISTORY_SNAPSHOT:
                 self.checkpoint_widgets.append(widget)
 
     def _scroll_to_end_and_select_last(self) -> None:
-        """Scroll to bottom and select last checkpoint."""
+        """Scroll to bottom and select last message."""
         container = self.query_one("#message-container", ScrollableContainer)
         container.scroll_end(animate=False)
-        # Select last checkpoint if any exist
-        if self.checkpoint_widgets:
-            last_widget = self.checkpoint_widgets[-1]
-            self.current_checkpoint_index = len(self.checkpoint_widgets) - 1
-            last_widget.add_class("selected")
-            self.selected_checkpoint_widget = last_widget
-            self.selected_checkpoint = last_widget.message
+        # Select last message
+        if self.message_widgets:
+            last_widget = self.message_widgets[-1]
+            self._select_message_widget(last_widget)
 
     def action_cancel_or_back(self) -> None:
         """Cancel search or go back to home screen."""
@@ -410,74 +466,101 @@ class SessionScreen(Screen):
         container.scroll_up()
 
     def action_scroll_top(self) -> None:
-        """Scroll to top."""
-        container = self.query_one("#message-container", ScrollableContainer)
-        container.scroll_home()
+        """Select first message."""
+        if self.message_widgets:
+            self._select_message_widget(self.message_widgets[0])
 
     def action_scroll_bottom(self) -> None:
-        """Scroll to bottom."""
-        container = self.query_one("#message-container", ScrollableContainer)
-        container.scroll_end()
+        """Select last message."""
+        if self.message_widgets:
+            self._select_message_widget(self.message_widgets[-1])
 
     def action_page_down(self) -> None:
-        """Scroll down by half a page."""
-        container = self.query_one("#message-container", ScrollableContainer)
-        container.scroll_page_down()
+        """Move selection down by 5 messages."""
+        if not self.message_widgets:
+            return
+        new_idx = min(self.current_message_index + 5, len(self.message_widgets) - 1)
+        self._select_message_widget(self.message_widgets[new_idx])
 
     def action_page_up(self) -> None:
-        """Scroll up by half a page."""
-        container = self.query_one("#message-container", ScrollableContainer)
-        container.scroll_page_up()
+        """Move selection up by 5 messages."""
+        if not self.message_widgets:
+            return
+        new_idx = max(self.current_message_index - 5, 0)
+        self._select_message_widget(self.message_widgets[new_idx])
 
-    def on_checkpoint_selected(self, event: CheckpointSelected) -> None:
-        """Handle checkpoint selection."""
-        self._select_checkpoint_widget(event.checkpoint)
-
-    def _select_checkpoint_widget(self, checkpoint: Message) -> None:
-        """Select a checkpoint and update UI."""
-        # Clear previous selection
-        if self.selected_checkpoint_widget:
-            self.selected_checkpoint_widget.remove_class("selected")
-
-        # Find and select the widget
-        for i, widget in enumerate(self.checkpoint_widgets):
-            if widget.message.uuid == checkpoint.uuid:
-                widget.add_class("selected")
-                widget.scroll_visible()
-                self.selected_checkpoint_widget = widget
-                self.current_checkpoint_index = i
+    def on_message_clicked(self, event: MessageClicked) -> None:
+        """Handle message click."""
+        # Find the widget for this message
+        for widget in self.message_widgets:
+            if widget.message.uuid == event.message.uuid:
+                self._select_message_widget(widget)
                 break
 
-        self.selected_checkpoint = checkpoint
-        cp_num = self.current_checkpoint_index + 1
-        total = len(self.checkpoint_widgets)
-        self.app.notify(f"Checkpoint {cp_num}/{total} - press 't' to teleport")
+    def _select_message_widget(self, widget: MessageWidget) -> None:
+        """Select a message widget and update UI."""
+        # Clear previous selection
+        if self.selected_message_widget:
+            self.selected_message_widget.remove_class("selected")
+            self.selected_message_widget.styles.background = None
+            self.selected_message_widget.styles.border_left = None
+
+        # Select the widget
+        widget.add_class("selected")
+        widget.styles.background = "blue"
+        widget.styles.border_left = ("thick", "yellow")
+        widget.scroll_visible()
+        self.selected_message_widget = widget
+        self.selected_message = widget.message
+
+        # Update index
+        try:
+            self.current_message_index = self.message_widgets.index(widget)
+        except ValueError:
+            self.current_message_index = -1
+
+        # Update checkpoint index if this is a checkpoint
+        if widget.message.type == MessageType.FILE_HISTORY_SNAPSHOT:
+            try:
+                self.current_checkpoint_index = self.checkpoint_widgets.index(widget)
+            except ValueError:
+                pass
+
+    def action_next_message(self) -> None:
+        """Go to next message."""
+        if not self.message_widgets:
+            return
+        if self.current_message_index < len(self.message_widgets) - 1:
+            self._select_message_widget(self.message_widgets[self.current_message_index + 1])
+
+    def action_prev_message(self) -> None:
+        """Go to previous message."""
+        if not self.message_widgets:
+            return
+        if self.current_message_index > 0:
+            self._select_message_widget(self.message_widgets[self.current_message_index - 1])
 
     def action_next_checkpoint(self) -> None:
         """Go to next checkpoint."""
         if not self.checkpoint_widgets:
-            self.app.notify("No checkpoints in this session")
             return
         self.current_checkpoint_index = (self.current_checkpoint_index + 1) % len(self.checkpoint_widgets)
         widget = self.checkpoint_widgets[self.current_checkpoint_index]
-        self._select_checkpoint_widget(widget.message)
+        self._select_message_widget(widget)
 
     def action_prev_checkpoint(self) -> None:
         """Go to previous checkpoint."""
         if not self.checkpoint_widgets:
-            self.app.notify("No checkpoints in this session")
             return
         self.current_checkpoint_index = (self.current_checkpoint_index - 1) % len(self.checkpoint_widgets)
         widget = self.checkpoint_widgets[self.current_checkpoint_index]
-        self._select_checkpoint_widget(widget.message)
+        self._select_message_widget(widget)
 
     def action_teleport(self) -> None:
-        """Launch teleport directly from selected checkpoint."""
+        """Launch teleport from selected message."""
         import asyncio
-        if self.selected_checkpoint:
+        if self.selected_message:
             asyncio.create_task(self._do_teleport())
-        else:
-            self.app.notify("Select a checkpoint first (Tab to navigate)")
 
     async def _do_teleport(self) -> None:
         """Execute the teleport and launch shell."""
@@ -485,15 +568,26 @@ class SessionScreen(Screen):
         import sys
         from one_claude.teleport.restore import FileRestorer
 
-        self.app.notify("Restoring files...")
-
         try:
+            # Get Session object for restorer
+            if not self.path.jsonl_files:
+                self.app.notify("No JSONL files in path", severity="error")
+                return
+
+            session_id = self.path.jsonl_files[-1].stem
+            session = self.scanner.get_session_by_id(session_id)
+            if not session:
+                self.app.notify("Session not found", severity="error")
+                return
+
             restorer = FileRestorer(self.scanner)
-            # Get message_uuid from checkpoint (strip "checkpoint-" prefix)
-            message_uuid = self.selected_checkpoint.uuid.replace("checkpoint-", "")
+            # Get message_uuid (strip "checkpoint-" prefix if present)
+            message_uuid = self.selected_message.uuid
+            if message_uuid.startswith("checkpoint-"):
+                message_uuid = message_uuid.replace("checkpoint-", "")
 
             teleport_session = await restorer.restore_to_sandbox(
-                self.session,
+                session,
                 message_uuid=message_uuid,
             )
 
@@ -531,11 +625,7 @@ class SessionScreen(Screen):
                 subprocess.run(shell_cmd, cwd=working_dir)
 
             # Cleanup temp directory after shell exits
-            self.app.notify("Cleaning up...")
             await sandbox.stop()
-
-            # TUI resumes here automatically
-            self.app.notify(f"Returned from teleport ({files_count} files)")
 
         except Exception as e:
             self.app.notify(f"Teleport error: {e}", severity="error")
@@ -614,13 +704,59 @@ class SessionScreen(Screen):
         self.current_match_index = -1
 
     def action_copy_session_id(self) -> None:
-        """Copy session ID to clipboard."""
+        """Copy conversation path ID to clipboard."""
         if pyperclip:
             try:
-                pyperclip.copy(self.session.id)
-                self.app.notify(f"Copied: {self.session.id[:8]}...")
+                pyperclip.copy(self.path.id)
+                self.app.notify(f"Copied: {self.path.id[:8]}...")
                 return
             except Exception:
                 pass
         # Fallback: just show the ID
-        self.app.notify(f"ID: {self.session.id}")
+        self.app.notify(f"ID: {self.path.id}")
+
+    def action_toggle_system(self) -> None:
+        """Toggle visibility of system messages."""
+        self.show_system = not self.show_system
+        status = "shown" if self.show_system else "hidden"
+        self.app.notify(f"System messages: {status}")
+        # Reload messages
+        self._reload_messages()
+
+    def action_switch_branch(self) -> None:
+        """Switch to a sibling branch."""
+        if not self.path.sibling_leaf_uuids:
+            self.app.notify("No other branches at this point")
+            return
+
+        # For now, just switch to the first sibling
+        # TODO: Show a picker if there are multiple siblings
+        sibling_uuid = self.path.sibling_leaf_uuids[0]
+
+        # Find the ConversationPath for this sibling
+        # We need to scan paths again or cache them
+        tree_cache = {}
+        paths = self.scanner.scan_conversation_paths(tree_cache=tree_cache)
+        for p in paths:
+            if p.leaf_uuid == sibling_uuid:
+                # Replace this screen with the sibling path
+                self.app.pop_screen()
+                self.app.push_screen(SessionScreen(p, self.scanner))
+                return
+
+        self.app.notify("Could not find sibling branch")
+
+    def _reload_messages(self) -> None:
+        """Reload all messages (used after toggling filters)."""
+        container = self.query_one("#message-container", ScrollableContainer)
+        # Clear existing widgets
+        container.remove_children()
+        self.message_widgets = []
+        self.checkpoint_widgets = []
+        self.selected_message = None
+        self.selected_message_widget = None
+        self.current_message_index = -1
+        self.current_checkpoint_index = -1
+        # Reload
+        self._load_messages()
+        self.call_after_refresh(self._scroll_to_end_and_select_last)
