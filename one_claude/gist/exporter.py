@@ -249,7 +249,7 @@ class SessionExporter:
         gist_files["import.sh"] = _make_import_script("GIST_ID_PLACEHOLDER")
 
         # Create gist
-        description = f"Claude session: {path.title or 'Untitled'}"[:100]
+        description = f"Claude session: {session_id}"
         gist_url, error = await self.api.create(gist_files, description)
 
         # Track export and update import script with real gist ID
