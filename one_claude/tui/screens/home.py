@@ -140,7 +140,7 @@ class HomeScreen(Screen):
         Binding("m", "toggle_mode", "Mode"),
         Binding("e", "export_gist", "[e]xport gist"),
         Binding("i", "import_gist", "[i]mport gist"),
-        Binding("g", "manage_gists", "[g]ists"),
+        Binding("E", "manage_gists", "[E]xports"),
     ]
 
     DEFAULT_CSS = """
@@ -693,7 +693,7 @@ class HomeScreen(Screen):
             self.app.notify(f"Import failed: {result.error}", severity="error")
 
     def action_manage_gists(self) -> None:
-        """Show gists management modal."""
-        from one_claude.tui.screens.gist_modals import GistsModal
+        """Show exports management screen."""
+        from one_claude.tui.screens.exports import ExportsScreen
 
-        self.app.push_screen(GistsModal())
+        self.app.push_screen(ExportsScreen())
