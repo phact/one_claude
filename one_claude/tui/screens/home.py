@@ -138,6 +138,9 @@ class HomeScreen(Screen):
         Binding("c", "copy_session_id", "Copy ID"),
         Binding("t", "teleport", "Teleport"),
         Binding("m", "toggle_mode", "Mode"),
+        Binding("e", "export_gist", "[e]xport gist"),
+        Binding("i", "import_gist", "[i]mport gist"),
+        Binding("g", "manage_gists", "[g]ists"),
     ]
 
     DEFAULT_CSS = """
@@ -202,6 +205,7 @@ class HomeScreen(Screen):
     ConversationListItem.dimmed .session-title {
         color: $text-muted;
     }
+
     """
 
     def __init__(self, scanner: ClaudeScanner):
@@ -219,7 +223,6 @@ class HomeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         """Create the home screen layout."""
-        # Search box at top
         yield Input(placeholder="Search titles & messages... (/ to focus)", id="search-input")
 
         with Horizontal(id="main-container"):
@@ -361,7 +364,6 @@ class HomeScreen(Screen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle search input submission (Enter)."""
         if event.input.id == "search-input":
-            # Focus the conversation list and select first item
             session_list = self.query_one("#session-list", ListView)
             session_list.focus()
             if self.paths:
@@ -613,3 +615,85 @@ class HomeScreen(Screen):
 
         except Exception as e:
             self.app.notify(f"Teleport error: {e}", severity="error")
+
+    def action_export_gist(self) -> None:
+        """Export selected session to gist."""
+        session_list = self.query_one("#session-list", ListView)
+        if session_list.index is not None and session_list.index < len(self.paths):
+            path = self.paths[session_list.index]
+            asyncio.create_task(self._do_export_gist(path))
+        else:
+            self.app.notify("Select a conversation first")
+
+    async def _do_export_gist(self, path: ConversationPath) -> None:
+        """Execute gist export."""
+        from one_claude.gist.api import get_token, start_device_flow
+        from one_claude.gist.exporter import SessionExporter
+        from one_claude.tui.screens.gist_modals import AuthModal
+
+        # Check auth first
+        if not get_token():
+            auth_info, error = await start_device_flow()
+            if error:
+                self.app.notify(f"Auth failed: {error}", severity="error")
+                return
+            # Show auth modal
+            authorized = await self.app.push_screen_wait(
+                AuthModal(
+                    auth_info["verification_uri"],
+                    auth_info["user_code"],
+                    auth_info["device_code"],
+                    auth_info["interval"],
+                )
+            )
+            if not authorized:
+                self.app.notify("Auth cancelled")
+                return
+
+        self.app.notify("Exporting to gist...")
+
+        exporter = SessionExporter(self.scanner)
+        result = await exporter.export_full_session(path)
+
+        if result.success and result.gist_url:
+            from one_claude.tui.screens.gist_modals import ExportResultModal
+
+            await self.app.push_screen_wait(
+                ExportResultModal(result.gist_url, result.message_count, result.checkpoint_count)
+            )
+        else:
+            self.app.notify(f"Export failed: {result.error}", severity="error")
+
+    def action_import_gist(self) -> None:
+        """Show import modal."""
+        from one_claude.tui.screens.gist_modals import ImportModal
+
+        async def do_import():
+            gist_url = await self.app.push_screen_wait(ImportModal())
+            if gist_url:
+                await self._do_import_gist(gist_url)
+
+        asyncio.create_task(do_import())
+
+    async def _do_import_gist(self, gist_url: str) -> None:
+        """Execute gist import."""
+        from one_claude.gist.importer import SessionImporter
+
+        self.app.notify("Importing from gist...")
+
+        importer = SessionImporter(self.scanner.claude_dir)
+        result = await importer.import_from_gist(gist_url)
+
+        if result.success:
+            msg = f"Imported {result.message_count} msgs, {result.checkpoint_count} checkpoints"
+            self.app.notify(msg)
+            self.app.notify(f"Session: {result.session_id[:8] if result.session_id else 'unknown'}")
+            self.refresh_conversations()
+        else:
+            self.app.notify(f"Import failed: {result.error}", severity="error")
+
+    def action_manage_gists(self) -> None:
+        """Show gists management modal."""
+        from one_claude.tui.screens.gist_modals import GistsModal
+
+        self.app.push_screen(GistsModal())

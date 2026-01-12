@@ -170,5 +170,122 @@ def tui(ctx: click.Context) -> None:
     app.run()
 
 
+@main.group()
+def gist() -> None:
+    """Gist export/import commands."""
+    pass
+
+
+@gist.command(name="import")
+@click.argument("gist_url_or_id")
+@click.pass_context
+def gist_import(ctx: click.Context, gist_url_or_id: str) -> None:
+    """Import a session from a GitHub gist."""
+    import asyncio
+
+    from rich.console import Console
+
+    from one_claude.gist.importer import SessionImporter
+
+    config = ctx.obj["config"]
+    console = Console()
+
+    async def do_import():
+        importer = SessionImporter(config.claude_dir)
+        result = await importer.import_from_gist(gist_url_or_id)
+
+        if result.success:
+            console.print(f"[green]Imported successfully![/green]")
+            console.print(f"  Session: {result.session_id}")
+            console.print(f"  Project: {result.project_path}")
+            console.print(f"  Messages: {result.message_count}")
+            console.print(f"  Checkpoints: {result.checkpoint_count}")
+        else:
+            console.print(f"[red]Import failed: {result.error}[/red]")
+
+    asyncio.run(do_import())
+
+
+@gist.command(name="export")
+@click.argument("session_id")
+@click.pass_context
+def gist_export(ctx: click.Context, session_id: str) -> None:
+    """Export a session to a GitHub gist."""
+    import asyncio
+
+    from rich.console import Console
+
+    from one_claude.core.scanner import ClaudeScanner
+    from one_claude.gist.exporter import SessionExporter
+
+    config = ctx.obj["config"]
+    console = Console()
+    scanner = ClaudeScanner(config.claude_dir)
+
+    # Find conversation path by session ID
+    tree_cache = {}
+    paths = scanner.scan_conversation_paths(tree_cache=tree_cache)
+
+    target_path = None
+    for path in paths:
+        if path.id == session_id or path.id.startswith(session_id):
+            target_path = path
+            break
+        for jsonl_file in path.jsonl_files:
+            if jsonl_file.stem == session_id or jsonl_file.stem.startswith(session_id):
+                target_path = path
+                break
+
+    if not target_path:
+        console.print(f"[red]Session not found: {session_id}[/red]")
+        return
+
+    async def do_export():
+        exporter = SessionExporter(scanner)
+        result = await exporter.export_full_session(target_path)
+
+        if result.success:
+            console.print(f"[green]Exported successfully![/green]")
+            console.print(f"  URL: {result.gist_url}")
+            console.print(f"  Messages: {result.message_count}")
+            console.print(f"  Checkpoints: {result.checkpoint_count}")
+        else:
+            console.print(f"[red]Export failed: {result.error}[/red]")
+
+    asyncio.run(do_export())
+
+
+@gist.command(name="list")
+def gist_list() -> None:
+    """List exported gists."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from one_claude.gist.store import load_exports
+
+    console = Console()
+    exports = load_exports()
+
+    if not exports:
+        console.print("[yellow]No exported gists yet[/yellow]")
+        return
+
+    table = Table(title="Exported Gists")
+    table.add_column("Title", style="white")
+    table.add_column("Messages", justify="right")
+    table.add_column("Date", style="green")
+    table.add_column("URL", style="cyan")
+
+    for export in exports:
+        table.add_row(
+            export.title[:30],
+            str(export.message_count),
+            export.exported_at[:10],
+            export.gist_url,
+        )
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     main()

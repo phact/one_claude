@@ -254,6 +254,7 @@ class SessionScreen(Screen):
         Binding("c", "copy_session_id", "Copy ID"),
         Binding("s", "toggle_system", "Toggle System"),
         Binding("b", "switch_branch", "[b]ranch"),
+        Binding("e", "export_from_message", "[e]xport from here"),
     ]
 
     DEFAULT_CSS = """
@@ -948,3 +949,53 @@ class SessionScreen(Screen):
         # Reload
         self._load_messages()
         self.call_after_refresh(self._scroll_to_end_and_select_last)
+
+    def action_export_from_message(self) -> None:
+        """Export from selected message to gist."""
+        import asyncio
+
+        if self.selected_message:
+            asyncio.create_task(self._do_export())
+        else:
+            self.app.notify("No message selected", severity="warning")
+
+    async def _do_export(self) -> None:
+        """Execute the export from selected message."""
+        from one_claude.gist.api import get_token, start_device_flow
+        from one_claude.gist.exporter import SessionExporter
+        from one_claude.tui.screens.gist_modals import AuthModal
+
+        # Check auth first
+        if not get_token():
+            auth_info, error = await start_device_flow()
+            if error:
+                self.app.notify(f"Auth failed: {error}", severity="error")
+                return
+            authorized = await self.app.push_screen_wait(
+                AuthModal(
+                    auth_info["verification_uri"],
+                    auth_info["user_code"],
+                    auth_info["device_code"],
+                    auth_info["interval"],
+                )
+            )
+            if not authorized:
+                self.app.notify("Auth cancelled")
+                return
+
+        self.app.notify("Exporting to gist...")
+
+        exporter = SessionExporter(self.scanner)
+        result = await exporter.export_from_message(
+            self.path,
+            self.selected_message.uuid,
+        )
+
+        if result.success and result.gist_url:
+            from one_claude.tui.screens.gist_modals import ExportResultModal
+
+            await self.app.push_screen_wait(
+                ExportResultModal(result.gist_url, result.message_count, result.checkpoint_count)
+            )
+        else:
+            self.app.notify(f"Export failed: {result.error}", severity="error")
