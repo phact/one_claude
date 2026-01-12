@@ -14,7 +14,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer
 from textual.message import Message as TextualMessage
 from textual.screen import Screen
-from textual.widgets import Collapsible, Input, Label, Static
+from textual.widgets import Collapsible, Footer, Input, Label, Static
 
 from one_claude.core.models import ConversationPath, Message, MessageTree, MessageType
 from one_claude.core.scanner import ClaudeScanner
@@ -238,33 +238,43 @@ class SessionScreen(Screen):
     """Screen showing conversation path details."""
 
     BINDINGS = [
-        Binding("escape", "cancel_or_back", "Back"),
+        # Vim navigation (hidden from footer)
         Binding("j", "next_message", "Down", show=False),
         Binding("k", "prev_message", "Up", show=False),
         Binding("ctrl+f", "page_down", "Page Down", show=False),
         Binding("ctrl+u", "page_up", "Page Up", show=False),
         Binding("g", "scroll_top", "Top", show=False),
         Binding("G", "scroll_bottom", "Bottom", show=False),
+        Binding("n", "next_match", "Next Match", show=False),
+        Binding("N", "prev_match", "Prev Match", show=False),
+        Binding("shift+tab", "prev_checkpoint", "Prev CP", show=False),
+        # Footer: Navigation
+        Binding("escape", "cancel_or_back", "Back"),
+        Binding("/", "start_search", "Search"),
+        Binding("tab", "next_checkpoint", "Next CP"),
+        # Footer: Actions
         Binding("t", "teleport", "Teleport"),
-        Binding("/", "start_search", "/ Search"),
-        Binding("n", "next_match", "n Next", show=False),
-        Binding("N", "prev_match", "N Prev", show=False),
-        Binding("tab", "next_checkpoint", "Tab Next CP"),
-        Binding("shift+tab", "prev_checkpoint", "S-Tab Prev CP", show=False),
-        Binding("c", "copy_session_id", "Copy ID"),
-        Binding("s", "toggle_system", "Toggle System"),
-        Binding("b", "switch_branch", "[b]ranch"),
-        Binding("e", "export_from_message", "[e]xport from here"),
+        Binding("c", "copy_session_id", "Copy"),
+        Binding("b", "switch_branch", "Branch"),
+        Binding("e", "export_from_message", "Export"),
+        # Footer: Display
+        Binding("s", "toggle_system", "System"),
     ]
 
     DEFAULT_CSS = """
+    SessionScreen {
+        background: $background;
+    }
+
     SessionScreen #session-header-row {
         width: 100%;
         height: 1;
+        margin: 0 1;
     }
 
     SessionScreen #session-title {
         width: 1fr;
+        text-style: bold;
     }
 
     SessionScreen #session-id {
@@ -272,31 +282,38 @@ class SessionScreen(Screen):
         color: $text-muted;
     }
 
-    SessionScreen .message-user {
-        background: $surface;
+    SessionScreen #session-meta {
+        color: $text-muted;
+        margin: 0 1 1 1;
     }
 
-    SessionScreen .message-assistant {
-        background: $surface-darken-1;
+    SessionScreen #message-container {
+        padding: 0 1;
     }
 
-    SessionScreen .message-summary {
-        background: $warning-muted;
-        border: solid $warning;
+    /* Message types with left accent bars (defined in app.py) */
+    SessionScreen .message-user .message-header {
+        color: $primary;
     }
 
-    SessionScreen .message-checkpoint {
-        background: $success-muted;
-        border: solid $success;
+    SessionScreen .message-assistant .message-header {
+        color: $secondary;
+    }
+
+    SessionScreen .message-summary .message-header {
+        color: $warning;
+    }
+
+    SessionScreen .message-checkpoint .message-header {
+        color: $success;
     }
 
     SessionScreen .checkpoint-info {
         color: $success;
     }
 
-    SessionScreen .message-system {
-        background: $surface-darken-2;
-        border: dashed gray;
+    SessionScreen .message-system .message-header {
+        color: $text-muted;
     }
 
     SessionScreen .system-info {
@@ -325,6 +342,12 @@ class SessionScreen(Screen):
 
     SessionScreen .search-match {
         background: $warning;
+        color: $background;
+    }
+
+    /* Selected message highlight */
+    SessionScreen .message-selected {
+        background: $panel;
     }
     """
 
@@ -379,6 +402,7 @@ class SessionScreen(Screen):
 
         # Message list
         yield ScrollableContainer(id="message-container")
+        yield Footer()
 
     def on_mount(self) -> None:
         """Load messages on mount."""
@@ -689,8 +713,8 @@ class SessionScreen(Screen):
 
         # Select the widget
         widget.add_class("selected")
-        widget.styles.background = "blue"
-        widget.styles.border_left = ("thick", "yellow")
+        widget.styles.background = "#1e2a3a"  # Subtle dark blue tint
+        widget.styles.border_left = ("thick", "#00d4ff")  # Cyan accent
         widget.scroll_visible()
         self.selected_message_widget = widget
         self.selected_message = widget.message

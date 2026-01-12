@@ -2,13 +2,44 @@
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer, Header
+from textual.theme import Theme
+from textual.widgets import Header
 
 from one_claude.config import Config
 from one_claude.core.scanner import ClaudeScanner
 from one_claude.teleport.sandbox import is_msb_available
+from one_claude.tui.screens.gist_modals import HelpModal
 from one_claude.tui.screens.home import HomeScreen
 from one_claude.tui.screens.session import SessionScreen
+
+
+# Noir theme: high contrast, cyan accents, colored accent bars
+THEME_NOIR = Theme(
+    name="noir",
+    primary="#00d4ff",
+    secondary="#b48cff",
+    accent="#00d4ff",
+    foreground="#e6e6e6",
+    background="#0d0d0d",
+    surface="#16161a",
+    panel="#1e1e23",
+    success="#50c878",
+    warning="#ffb432",
+    error="#ff5a5a",
+    dark=True,
+    variables={
+        "border": "#32323c",
+        "border-blurred": "#28282e",
+        "surface-darken-1": "#121215",
+        "surface-darken-2": "#0a0a0c",
+        "text-muted": "#78788c",
+        "scrollbar": "#32323c",
+        "scrollbar-hover": "#50505a",
+        "footer-background": "#16161a",
+        "footer-key": "#00d4ff",
+        "footer-description": "#78788c",
+    },
+)
 
 
 class OneClaude(App):
@@ -19,7 +50,7 @@ class OneClaude(App):
 
     CSS = """
     Screen {
-        background: $surface;
+        background: $background;
     }
 
     #main-container {
@@ -27,65 +58,80 @@ class OneClaude(App):
         width: 100%;
     }
 
-    .session-list {
-        width: 100%;
-        height: 100%;
+    /* Sidebar styling */
+    .sidebar {
+        width: 26;
+        dock: left;
+        border-right: solid $border;
+        padding: 0 1;
     }
 
-    .session-item {
-        padding: 1;
-        border-bottom: solid $primary-background;
+    .content {
+        width: 1fr;
+        padding-left: 1;
     }
 
-    .session-item:hover {
-        background: $primary-background;
-    }
-
-    .session-item.--highlight {
-        background: $primary;
-    }
-
-    .session-title {
-        text-style: bold;
-    }
-
-    .session-meta {
+    /* Section labels */
+    .section-label {
         color: $text-muted;
+        text-style: bold;
+        margin-bottom: 1;
     }
 
+    /* Message styling with left accent bars */
     .message-container {
         padding: 1;
         margin-bottom: 1;
-        border: solid $primary-background;
+        border-left: thick gray;
     }
 
     .message-user {
-        background: $primary-background-darken-2;
+        border-left: thick $primary;
     }
 
     .message-assistant {
+        background: $surface;
+        border-left: thick $secondary;
+    }
+
+    .message-summary {
+        background: $warning 15%;
+        border-left: thick $warning;
+    }
+
+    .message-checkpoint {
+        background: $success 15%;
+        border-left: thick $success;
+    }
+
+    .message-system {
         background: $surface-darken-1;
+        border-left: thick gray;
     }
 
     .message-header {
         text-style: bold;
         margin-bottom: 1;
+        color: $text-muted;
+    }
+
+    .message-user .message-header {
+        color: $primary;
+    }
+
+    .message-assistant .message-header {
+        color: $secondary;
+    }
+
+    .message-checkpoint .message-header {
+        color: $success;
     }
 
     .tool-use {
-        background: $warning-muted;
+        background: $surface-darken-1;
         padding: 0 1;
         margin: 1 0;
-    }
-
-    .sidebar {
-        width: 30;
-        dock: left;
-        border-right: solid $primary-background;
-    }
-
-    .content {
-        width: 1fr;
+        border-left: solid $warning;
     }
 
     Header {
@@ -98,13 +144,12 @@ class OneClaude(App):
 
     #search-input {
         dock: top;
-        margin: 1;
+        margin: 0 1;
     }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("/", "search", "Search"),
         Binding("escape", "back", "Back"),
         Binding("?", "help", "Help"),
         Binding("r", "refresh", "Refresh"),
@@ -115,6 +160,9 @@ class OneClaude(App):
         self.config = config or Config.load()
         self.scanner = ClaudeScanner(self.config.claude_dir)
 
+        # Register and set Noir theme
+        self.register_theme(THEME_NOIR)
+
         # Check microsandbox availability for sandbox mode
         self.sandbox_available = is_msb_available()
 
@@ -122,14 +170,14 @@ class OneClaude(App):
         mode = "sandbox" if self.sandbox_available else "local"
         self.sub_title = f"Time Travel for Claude Code [{mode}]"
 
+    def on_mount(self) -> None:
+        """Handle app mount - push the home screen."""
+        self.theme = "noir"
+        self.push_screen(HomeScreen(self.scanner))
+
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
         yield Header()
-        yield Footer()
-
-    def on_mount(self) -> None:
-        """Handle app mount - push the home screen."""
-        self.push_screen(HomeScreen(self.scanner))
 
     def action_search(self) -> None:
         """Focus search on home screen."""
@@ -147,11 +195,9 @@ class OneClaude(App):
             self.screen.refresh_sessions()
 
     def action_help(self) -> None:
-        """Show help."""
-        self.notify(
-            "/ - Search | Enter - Open | Esc - Back | q - Quit",
-            title="Keyboard Shortcuts",
-        )
+        """Show help modal with keyboard shortcuts."""
+        screen_name = "session" if isinstance(self.screen, SessionScreen) else "home"
+        self.push_screen(HelpModal(screen_name))
 
     def open_session(self, session_id: str) -> None:
         """Open a session in detail view."""

@@ -15,23 +15,24 @@ class ExportsScreen(Screen):
     """Screen for viewing and managing exported gists."""
 
     BINDINGS = [
-        Binding("j", "cursor_down", "Down", show=False),
+        Binding("j", "cursor_down", "j/k nav", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        Binding("escape", "go_back", "Back"),
-        Binding("q", "go_back", "Back"),
-        Binding("u", "copy_url", "Copy [u]rl"),
-        Binding("c", "copy_command", "Copy [c]ommand"),
-        Binding("d", "delete_gist", "[d]elete"),
-        Binding("enter", "copy_command", "Copy command"),
+        Binding("escape", "go_back", "Esc"),
+        Binding("q", "go_back", "q·back"),
+        Binding("u", "copy_url", "u·url"),
+        Binding("c", "copy_command", "c·cmd"),
+        Binding("d", "delete_gist", "d·delete"),
+        Binding("enter", "copy_command", "Enter"),
     ]
 
     DEFAULT_CSS = """
     ExportsScreen {
-        background: $surface;
+        background: $background;
     }
     ExportsScreen #title {
         text-align: center;
         text-style: bold;
+        color: $primary;
         padding: 1;
     }
     ExportsScreen #empty {
@@ -42,6 +43,10 @@ class ExportsScreen(Screen):
     ExportsScreen ListView {
         height: 1fr;
         margin: 0 2;
+        border-left: thick gray;
+    }
+    ExportsScreen ListView:focus {
+        border-left: thick $primary;
     }
     ExportsScreen .export-item {
         padding: 0 1;
@@ -49,12 +54,13 @@ class ExportsScreen(Screen):
     }
     ExportsScreen .export-title {
         text-style: bold;
+        color: $foreground;
     }
     ExportsScreen .export-meta {
         color: $text-muted;
     }
     ExportsScreen ListItem.--highlight {
-        background: $primary-darken-2;
+        background: $surface;
     }
     """
 

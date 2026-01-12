@@ -16,7 +16,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import Input, Label, ListItem, ListView, Static
+from textual.widgets import Footer, Input, Label, ListItem, ListView, Static
 
 from one_claude.core.models import ConversationPath, Project
 from one_claude.core.scanner import ClaudeScanner
@@ -27,13 +27,18 @@ from one_claude.teleport.executors import get_mode_names
 class ConversationListItem(ListItem):
     """A single conversation path item in the list."""
 
-    def __init__(self, path: ConversationPath, is_match: bool = True):
+    def __init__(self, path: ConversationPath, is_match: bool = True, next_prefix: str = ""):
         super().__init__()
         self.path = path
         self.is_match = is_match
+        self.next_prefix = next_prefix  # Prefix of next item, for tree connection
         # Add dimmed class for non-matching items during search
         if not is_match:
             self.add_class("dimmed")
+        # Add branch class for tree children (items with indent prefix)
+        prefix = path.tree_prefix or ""
+        if prefix and prefix not in ("", "● "):
+            self.add_class("branch")
 
     def compose(self) -> ComposeResult:
         """Create the conversation item display."""
@@ -46,19 +51,87 @@ class ConversationListItem(ListItem):
         last_msg = self.path.last_user_message or ""
 
         path_id = self.path.id[:8]
-        meta = f"{self._get_project_name()}  {self._format_time()}  {self.path.message_count} msgs"
+
+        # Meta line with tree continuation prefix (separate for coloring)
+        meta_prefix = self._get_meta_prefix()
+        meta_content = f"{self._get_project_name()}  {self._format_time()}  {self.path.message_count} msgs"
 
         # Add branch indicator if this path has siblings
         if self.path.sibling_leaf_uuids:
             branch_count = len(self.path.sibling_leaf_uuids) + 1
-            meta += f"  {branch_count} branches"
+            meta_content += f"  {branch_count} branches"
 
         with Horizontal(classes="session-row"):
-            yield Static(display_title, classes="session-title")
+            yield Static(display_title, classes="session-title", markup=False)
             if last_msg:
-                yield Static(f"  {last_msg}", classes="session-last-msg")
+                yield Static(f"  {last_msg}", classes="session-last-msg", markup=False)
             yield Static(path_id, classes="session-id")
-        yield Static(meta, classes="session-meta")
+        with Horizontal(classes="session-row"):
+            # Use Rich markup to color the tree prefix differently from content
+            if meta_prefix:
+                safe_content = meta_content.replace("[", "\\[")
+                full_meta = f"[white]{meta_prefix}[/white]{safe_content}"
+                yield Static(full_meta, classes="session-meta", markup=True)
+            else:
+                yield Static(meta_content, classes="session-meta", markup=False)
+
+    def _get_meta_prefix(self) -> str:
+        """Get the prefix for the metadata line to continue tree lines."""
+        prefix = self.path.tree_prefix or ""
+        if not prefix:
+            return ""
+
+        # Check if this is a root item (starts with ●)
+        is_root = prefix.startswith('●')
+
+        # Check if current item's last branch char is └ (no continuation)
+        # Only those items need extra │ to connect to children
+        ends_with_last_branch = False
+        for char in prefix:
+            if char == '└':
+                ends_with_last_branch = True
+            elif char in '●├│':
+                ends_with_last_branch = False  # These continue naturally
+
+        # Replace tree drawing chars with their continuation equivalents
+        result = []
+        # Add leading spaces for root items to align with bullet (● renders wider)
+        if is_root:
+            result.append(' ')
+            result.append(' ')
+        for char in prefix:
+            if char == '●':
+                result.append('│')  # Root continues down
+            elif char == '├':
+                result.append('│')  # Branch point continues
+            elif char == '└':
+                result.append(' ')  # Last branch, no continuation
+            elif char == '│':
+                result.append('│')  # Vertical line continues
+            elif char == '─':
+                result.append(' ')  # Horizontal line becomes space
+            else:
+                result.append(char)  # Keep spaces as-is
+
+        meta = list(''.join(result))
+
+        # Only add connection │ if current item ends its branch (└) but has children
+        next_prefix = self.next_prefix
+        if ends_with_last_branch and next_prefix and len(next_prefix) > len(prefix):
+            # Find where the child's branch char starts
+            branch_pos = -1
+            for i, char in enumerate(next_prefix):
+                if char in '├└':
+                    branch_pos = i
+                    break
+
+            if branch_pos >= 0:
+                # Ensure meta is long enough and insert │ at branch position
+                while len(meta) <= branch_pos:
+                    meta.append(' ')
+                meta[branch_pos] = '│'
+
+        return ''.join(meta)
 
     def _get_project_name(self) -> str:
         """Get short project name."""
@@ -123,6 +196,7 @@ class HomeScreen(Screen):
     """Home screen showing all conversation paths."""
 
     BINDINGS = [
+        # Vim navigation (hidden from footer)
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("g", "go_top_prefix", "Top", show=False),
@@ -131,48 +205,85 @@ class HomeScreen(Screen):
         Binding("ctrl+d", "page_down", "Page Down", show=False),
         Binding("ctrl+f", "page_down_full", "Page Down", show=False),
         Binding("ctrl+b", "page_up_full", "Page Up", show=False),
-        Binding("enter", "select", "Open"),
-        Binding("/", "focus_search", "/ Search"),
+        Binding("tab", "switch_focus", "Switch", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
-        Binding("tab", "switch_focus", "Tab Switch", show=False),
-        Binding("c", "copy_session_id", "Copy ID"),
+        # Footer: Navigation
+        Binding("enter", "select", "Open"),
+        Binding("/", "focus_search", "Search"),
+        # Footer: Actions
         Binding("t", "teleport", "Teleport"),
+        Binding("c", "copy_session_id", "Copy ID"),
         Binding("m", "toggle_mode", "Mode"),
-        Binding("e", "export_gist", "[e]xport gist"),
-        Binding("i", "import_gist", "[i]mport gist"),
-        Binding("E", "manage_gists", "[E]xports"),
+        # Footer: Gists
+        Binding("e", "export_gist", "Export"),
+        Binding("i", "import_gist", "Import"),
+        Binding("E", "manage_gists", "Gists"),
     ]
 
     DEFAULT_CSS = """
-    HomeScreen #search-input {
-        dock: top;
-        width: 100%;
-        margin: 1 2;
+    HomeScreen {
+        background: $background;
     }
 
     HomeScreen #main-container {
         width: 100%;
         height: 1fr;
-        margin-top: 1;
+    }
+
+    HomeScreen #search-bar {
+        margin: 1 2 1 0;
+        height: 3;
+        width: 90%;
+    }
+
+    HomeScreen #search-input {
+        width: 90%;
+    }
+
+    HomeScreen #mode-indicator {
+        dock: right;
+        width: auto;
+        padding: 1 1;
+    }
+
+    HomeScreen #project-list {
+        height: 1fr;
     }
 
     HomeScreen #session-list {
         width: 100%;
+        height: 1fr;
     }
 
-    HomeScreen #mode-indicator {
-        dock: bottom;
-        width: 100%;
+    /* Project list styling */
+    ProjectListItem {
         height: 1;
-        text-align: right;
-        background: $surface;
-        color: $text-muted;
-        padding: 0 2;
+        padding: 0 1;
     }
 
+    ProjectListItem:hover {
+        background: $surface;
+    }
+
+    ProjectListItem.-highlight {
+        background: $primary;
+        color: $background;
+    }
+
+    /* Conversation list */
     ConversationListItem {
         width: 100%;
         height: auto;
+        padding: 0 1;
+        margin-bottom: 0;
+    }
+
+    ConversationListItem:hover {
+        background: $surface;
+    }
+
+    ConversationListItem.-highlight {
+        background: $panel;
     }
 
     ConversationListItem .session-row {
@@ -182,6 +293,7 @@ class HomeScreen(Screen):
 
     ConversationListItem .session-title {
         width: 1fr;
+        text-style: bold;
     }
 
     ConversationListItem .session-id {
@@ -196,6 +308,7 @@ class HomeScreen(Screen):
 
     ConversationListItem .session-meta {
         width: 100%;
+        color: $text-muted;
     }
 
     ConversationListItem.dimmed {
@@ -204,6 +317,7 @@ class HomeScreen(Screen):
 
     ConversationListItem.dimmed .session-title {
         color: $text-muted;
+        text-style: none;
     }
 
     """
@@ -223,18 +337,18 @@ class HomeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         """Create the home screen layout."""
-        yield Input(placeholder="Search titles & messages... (/ to focus)", id="search-input")
-
         with Horizontal(id="main-container"):
             with Vertical(classes="sidebar"):
                 yield Label("Projects", id="projects-header")
                 yield ListView(id="project-list")
             with Vertical(classes="content"):
+                with Horizontal(id="search-bar"):
+                    yield Input(placeholder="Search... (/ to focus)", id="search-input")
+                    yield Static(f"[#00d4ff]m[/] {self.teleport_mode}", id="mode-indicator", markup=True)
                 yield Label("Conversations", id="sessions-header")
                 yield ListView(id="session-list")
 
-        # Mode indicator at bottom right (markup=False to show literal brackets)
-        yield Static(f"[m] {self.teleport_mode}", id="mode-indicator", markup=False)
+        yield Footer()
 
     def on_mount(self) -> None:
         """Load conversations on mount."""
@@ -334,10 +448,14 @@ class HomeScreen(Screen):
         else:
             self.paths = list(base_paths)
 
-        for path in self.paths:
+        for i, path in enumerate(self.paths):
             # If searching, dim non-matching paths (but still show them if tree has a match)
             is_match = not self.search_query or path.id in matching_ids
-            session_list.append(ConversationListItem(path, is_match=is_match))
+            # Get next item's prefix for tree connection
+            next_prefix = ""
+            if i + 1 < len(self.paths):
+                next_prefix = self.paths[i + 1].tree_prefix or ""
+            session_list.append(ConversationListItem(path, is_match=is_match, next_prefix=next_prefix))
 
         # Update header
         header = self.query_one("#sessions-header", Label)
@@ -546,7 +664,7 @@ class HomeScreen(Screen):
 
         # Update the indicator
         indicator = self.query_one("#mode-indicator", Static)
-        indicator.update(f"[m] {self.teleport_mode}")
+        indicator.update(f"[#00d4ff]m[/] {self.teleport_mode}")
 
     def action_teleport(self) -> None:
         """Teleport to the selected conversation."""
