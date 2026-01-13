@@ -42,12 +42,33 @@ def get_git_info(cwd: str) -> dict | None:
 
         branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
         commit = run(["git", "rev-parse", "HEAD"])
-        remote = run(["git", "remote", "get-url", "origin"])
+
+        # Get the remote that tracks this branch (more likely to have the commit)
+        tracking_remote = ""
+        if branch:
+            tracking_remote = run(["git", "config", f"branch.{branch}.remote"])
+
+        # Get remote URL - prefer tracking remote, fall back to origin
+        remote = ""
+        if tracking_remote:
+            remote = run(["git", "remote", "get-url", tracking_remote])
+        if not remote:
+            remote = run(["git", "remote", "get-url", "origin"])
+
+        # Also capture all remotes for reference
+        all_remotes = {}
+        remote_names = run(["git", "remote"]).split("\n")
+        for name in remote_names:
+            if name:
+                url = run(["git", "remote", "get-url", name])
+                if url:
+                    all_remotes[name] = url
 
         return {
             "branch": branch or None,
             "commit": commit or None,
             "remote": remote or None,
+            "all_remotes": all_remotes if all_remotes else None,
         }
     except Exception:
         return None
