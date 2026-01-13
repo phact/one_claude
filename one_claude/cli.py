@@ -38,6 +38,7 @@ def sessions(ctx: click.Context) -> None:
 
     console = Console()
     table = Table(title="Claude Code Sessions")
+    table.add_column("Session ID", style="dim")
     table.add_column("Project", style="cyan")
     table.add_column("Title", style="white")
     table.add_column("Messages", justify="right")
@@ -48,7 +49,8 @@ def sessions(ctx: click.Context) -> None:
         project_name = session.project_display.rstrip("/").split("/")[-1]
         title = (session.title or "Untitled")[:40]
         updated = session.updated_at.strftime("%Y-%m-%d %H:%M")
-        table.add_row(project_name, title, str(session.message_count), updated)
+        session_id = session.id[:12] + "..."
+        table.add_row(session_id, project_name, title, str(session.message_count), updated)
 
     console.print(table)
 
@@ -148,14 +150,16 @@ def search(ctx: click.Context, query: str, mode: str, limit: int) -> None:
         return
 
     table = Table(title=f"Search: {query}")
+    table.add_column("Session ID", style="dim")
     table.add_column("Score", justify="right", style="cyan")
     table.add_column("Session", style="white")
     table.add_column("Snippet", style="dim")
 
     for result in results:
+        session_id = result.session.id[:12] + "..."
         title = result.session.title or result.session.id[:8]
         snippet = result.snippet[:60] if result.snippet else ""
-        table.add_row(f"{result.score:.2f}", title[:40], snippet)
+        table.add_row(session_id, f"{result.score:.2f}", title[:40], snippet)
 
     console.print(table)
 
