@@ -7,6 +7,15 @@ from pathlib import Path
 from typing import Any
 
 
+def escape_project_path(path: str) -> str:
+    """Escape path for Claude's project directory naming.
+
+    Claude escapes both / and _ as - in project directory names.
+    The leading / becomes a leading - in the directory name.
+    """
+    return path.replace("/", "-").replace("_", "-")
+
+
 class MessageType(Enum):
     """Type of message in a session."""
 

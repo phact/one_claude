@@ -131,7 +131,7 @@ class DockerExecutor(TeleportExecutor):
         if term:
             docker_base += f" -e TERM={term}"
 
-        claude_cmd = f"{docker_base} --name teleport-claude {image} claude --resume {session_id} --dangerously-skip-permissions"
+        claude_cmd = f"{docker_base} --name teleport-claude {image} claude --resume {session_id}"
         shell_cmd = f"{docker_base} --name teleport-shell {image} bash"
 
         # tmux with dual panes: claude on left, shell on right
@@ -142,7 +142,7 @@ tmux kill-session -t teleport 2>/dev/null
 docker rm -f teleport-claude teleport-shell 2>/dev/null
 tmux new-session -d -s teleport "{claude_cmd}" \\; \
     split-window -h "{shell_cmd}" \\; \
-    send-keys "echo 'CMD: claude --resume {session_id} --dangerously-skip-permissions'" Enter \\; \
+    send-keys "echo 'CMD: claude --resume {session_id}'" Enter \\; \
     send-keys "tree -L 2 2>/dev/null || ls -la" Enter \\; \
     select-pane -t 0 \\; \
     attach-session -t teleport
@@ -189,7 +189,7 @@ class MicrovmExecutor(TeleportExecutor):
         if term:
             msb_prefix += f" --env TERM={term}"
 
-        claude_cmd = f'{msb_prefix} -e "claude --resume {session_id} --permission-mode bypassPermissions" {image}'
+        claude_cmd = f'{msb_prefix} -e "claude --resume {session_id}" {image}'
         shell_cmd = f"{msb_prefix} -e bash {image}"
 
         # tmux with dual panes: claude on left, shell on right

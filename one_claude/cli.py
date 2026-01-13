@@ -178,30 +178,188 @@ def gist() -> None:
 
 @gist.command(name="import")
 @click.argument("gist_url_or_id")
+@click.option("--teleport", "-t", is_flag=True, help="Teleport into the session after import")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["local", "docker", "microvm"]),
+    default="docker",
+    help="Teleport mode: local, docker, or microvm (default: docker)",
+)
+@click.option(
+    "--path",
+    "-p",
+    type=click.Path(),
+    default=None,
+    help="Path to clone/import project to (default: prompt or cwd)",
+)
 @click.pass_context
-def gist_import(ctx: click.Context, gist_url_or_id: str) -> None:
+def gist_import(ctx: click.Context, gist_url_or_id: str, teleport: bool, mode: str, path: str | None) -> None:
     """Import a session from a GitHub gist."""
     import asyncio
+    import os
+    import subprocess
+    from pathlib import Path
 
     from rich.console import Console
 
-    from one_claude.gist.importer import SessionImporter
+    from one_claude.gist.importer import ExportInfo, SessionImporter
 
     config = ctx.obj["config"]
     console = Console()
 
+    def clone_repo(git_info: dict, dest_path: str) -> bool:
+        """Clone git repo and checkout specific commit."""
+        remote = git_info.get("remote")
+        commit = git_info.get("commit")
+
+        if not remote:
+            console.print("[red]No git remote in export[/red]")
+            return False
+
+        console.print(f"[cyan]Cloning {remote}...[/cyan]")
+        result = subprocess.run(
+            ["git", "clone", remote, dest_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]Clone failed: {result.stderr}[/red]")
+            return False
+
+        if commit:
+            console.print(f"[cyan]Checking out {commit[:8]}...[/cyan]")
+            result = subprocess.run(
+                ["git", "checkout", commit],
+                cwd=dest_path,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                console.print(f"[yellow]Warning: Could not checkout {commit[:8]}[/yellow]")
+
+        return True
+
     async def do_import():
         importer = SessionImporter(config.claude_dir)
-        result = await importer.import_from_gist(gist_url_or_id)
+
+        # First fetch export info to check if we need to clone
+        console.print("[dim]Fetching export info...[/dim]")
+        info = await importer.fetch_export_info(gist_url_or_id)
+
+        if isinstance(info, str):
+            console.print(f"[red]Failed: {info}[/red]")
+            return
+
+        final_path = None
+        restore_files = False
+
+        # If custom path provided, always use it (clone/restore there)
+        if path:
+            final_path = os.path.abspath(path)
+            if os.path.exists(final_path):
+                console.print(f"[yellow]Path already exists:[/yellow] {final_path}")
+                if not click.confirm("Use existing directory?"):
+                    return
+            elif info.git_info and info.git_info.get("remote"):
+                if not clone_repo(info.git_info, final_path):
+                    return
+                restore_files = True
+            else:
+                restore_files = True  # Create dir and restore from checkpoints
+
+        # Check if project exists (only if no custom path provided)
+        elif not info.project_exists:
+            console.print(f"[yellow]Project directory not found:[/yellow] {info.project_path}")
+
+            if info.git_info and info.git_info.get("remote"):
+                # Prompt for clone path
+                cwd = os.getcwd()
+                repo_name = info.git_info["remote"].rstrip("/").split("/")[-1].replace(".git", "")
+                default_path = os.path.join(cwd, repo_name)
+                clone_path = click.prompt(
+                    "Clone to",
+                    default=default_path,
+                    type=click.Path(),
+                )
+                clone_path = os.path.abspath(clone_path)
+
+                if os.path.exists(clone_path):
+                    console.print(f"[yellow]Path already exists:[/yellow] {clone_path}")
+                    if not click.confirm("Use existing directory?"):
+                        return
+                else:
+                    if not clone_repo(info.git_info, clone_path):
+                        return
+
+                final_path = clone_path
+                restore_files = True
+            else:
+                # No git info - prompt and restore files from checkpoints
+                cwd = os.getcwd()
+                dir_name = Path(info.project_path).name
+                default_path = os.path.join(cwd, dir_name)
+                final_path = click.prompt(
+                    "Create project at",
+                    default=default_path,
+                    type=click.Path(),
+                )
+                final_path = os.path.abspath(final_path)
+                restore_files = True
+
+        # Do the import
+        result = await importer.import_session(info, final_path, restore_files=restore_files)
 
         if result.success:
-            console.print(f"[green]Imported successfully![/green]")
-            console.print(f"  Session: {result.session_id}")
-            console.print(f"  Project: {result.project_path}")
-            console.print(f"  Messages: {result.message_count}")
-            console.print(f"  Checkpoints: {result.checkpoint_count}")
+            if result.already_imported:
+                console.print(f"[yellow]Already imported[/yellow]")
+                console.print(f"  Session: {result.session_id}")
+                console.print(f"  Project: {result.project_path}")
+            else:
+                console.print(f"[green]Imported successfully![/green]")
+                console.print(f"  Session: {result.session_id}")
+                console.print(f"  Project: {result.project_path}")
+                console.print(f"  Messages: {result.message_count}")
+                console.print(f"  Checkpoints: {result.checkpoint_count}")
+                if result.files_restored:
+                    console.print(f"  Files restored: {result.files_restored}")
+
+            if teleport:
+                console.print(f"\n[cyan]Teleporting into session (mode: {mode})...[/cyan]")
+                await do_teleport(result.session_id, result.project_path, mode, console)
         else:
             console.print(f"[red]Import failed: {result.error}[/red]")
+
+    async def do_teleport(session_id: str, project_path: str, mode: str, console: Console):
+        from one_claude.core.scanner import ClaudeScanner
+        from one_claude.teleport.restore import FileRestorer
+
+        scanner = ClaudeScanner(config.claude_dir)
+        restorer = FileRestorer(scanner)
+
+        # Find the imported session
+        session = scanner.get_session_by_id(session_id)
+        if not session:
+            console.print(f"[red]Could not find imported session: {session_id}[/red]")
+            return
+
+        # Restore to sandbox (latest message)
+        teleport_session = await restorer.restore_to_sandbox(
+            session,
+            message_uuid=None,  # Latest
+            mode=mode,
+        )
+
+        sandbox = teleport_session.sandbox
+
+        # Get shell command
+        shell_cmd = sandbox.get_shell_command(term=os.environ.get("TERM"))
+
+        # Run the teleport command
+        try:
+            subprocess.run(shell_cmd, cwd=sandbox.working_dir)
+        finally:
+            await sandbox.stop()
 
     asyncio.run(do_import())
 

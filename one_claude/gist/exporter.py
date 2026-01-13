@@ -42,12 +42,33 @@ def get_git_info(cwd: str) -> dict | None:
 
         branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
         commit = run(["git", "rev-parse", "HEAD"])
-        remote = run(["git", "remote", "get-url", "origin"])
+
+        # Get the remote that tracks this branch (more likely to have the commit)
+        tracking_remote = ""
+        if branch:
+            tracking_remote = run(["git", "config", f"branch.{branch}.remote"])
+
+        # Get remote URL - prefer tracking remote, fall back to origin
+        remote = ""
+        if tracking_remote:
+            remote = run(["git", "remote", "get-url", tracking_remote])
+        if not remote:
+            remote = run(["git", "remote", "get-url", "origin"])
+
+        # Also capture all remotes for reference
+        all_remotes = {}
+        remote_names = run(["git", "remote"]).split("\n")
+        for name in remote_names:
+            if name:
+                url = run(["git", "remote", "get-url", name])
+                if url:
+                    all_remotes[name] = url
 
         return {
             "branch": branch or None,
             "commit": commit or None,
             "remote": remote or None,
+            "all_remotes": all_remotes if all_remotes else None,
         }
     except Exception:
         return None
@@ -165,9 +186,30 @@ class SessionExporter:
         from_message_uuid: str | None,
     ) -> ExportResult:
         """Execute the export."""
-        # Load messages
-        messages = self.scanner.load_conversation_path_messages(path)
-        if not messages:
+        if not path.jsonl_files:
+            return ExportResult(
+                success=False,
+                gist_url=None,
+                error="No JSONL files to export",
+                message_count=0,
+                checkpoint_count=0,
+            )
+
+        # Read raw JSONL lines (preserves Claude's native format)
+        jsonl_file = path.jsonl_files[-1]
+        raw_messages = []
+        with open(jsonl_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = orjson.loads(line)
+                    raw_messages.append(msg)
+                except Exception:
+                    continue
+
+        if not raw_messages:
             return ExportResult(
                 success=False,
                 gist_url=None,
@@ -179,10 +221,10 @@ class SessionExporter:
         # Filter if from_message specified
         if from_message_uuid:
             idx = next(
-                (i for i, m in enumerate(messages) if m.uuid == from_message_uuid),
+                (i for i, m in enumerate(raw_messages) if m.get("uuid") == from_message_uuid),
                 0,
             )
-            messages = messages[idx:]
+            raw_messages = raw_messages[idx:]
 
         # Get git info from project path
         git_info = None
@@ -190,10 +232,11 @@ class SessionExporter:
             git_info = get_git_info(path.project_display)
 
         # Get session ID and checkpoints
-        session_id = path.jsonl_files[-1].stem if path.jsonl_files else path.id
+        session_id = jsonl_file.stem
         checkpoints = self.file_history.get_checkpoints_for_session(session_id)
 
-        # Build path mapping from messages
+        # Load parsed messages for path mapping (still needed for checkpoint paths)
+        messages = self.scanner.load_conversation_path_messages(path)
         path_mapping = self._build_path_mapping(messages)
 
         # Build checkpoint manifest
@@ -205,7 +248,7 @@ class SessionExporter:
                 "versions": [cp.version for cp in versions],
             }
 
-        # Build export data
+        # Build export data with raw messages (native Claude format)
         export_data = {
             "version": EXPORT_VERSION,
             "export_type": "from_message" if from_message_uuid else "full",
@@ -219,7 +262,7 @@ class SessionExporter:
                 "updated_at": path.updated_at.isoformat(),
             },
             "git_info": git_info,
-            "messages": [_serialize_message(m) for m in messages],
+            "messages": raw_messages,  # Native Claude format
             "checkpoint_manifest": checkpoint_manifest,
             "from_message_uuid": from_message_uuid,
         }
