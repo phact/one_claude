@@ -9,7 +9,7 @@ from pathlib import Path
 import orjson
 
 from one_claude.core.file_history import FileHistoryManager
-from one_claude.core.models import Message, MessageType, Session
+from one_claude.core.models import Message, MessageType, Session, escape_project_path
 from one_claude.core.parser import extract_file_paths_from_message
 from one_claude.core.scanner import ClaudeScanner
 from one_claude.teleport.sandbox import TeleportSandbox
@@ -266,9 +266,8 @@ class FileRestorer:
         source_claude_dir = self.scanner.claude_dir
         # Inside sandbox, CWD is /workspace/<original-path>, so Claude will look for
         # projects/-workspace-<original-path>/. We need to match that.
-        # Claude escapes both / and _ as - in project directory names.
         sandbox_project_path = f"/workspace{session.project_display}"
-        project_dir_name = sandbox_project_path.replace("/", "-").replace("_", "-")
+        project_dir_name = escape_project_path(sandbox_project_path)
 
         # Create truncated JSONL
         jsonl_content = self._truncate_jsonl_to_message(

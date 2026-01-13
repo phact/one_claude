@@ -178,10 +178,20 @@ def gist() -> None:
 
 @gist.command(name="import")
 @click.argument("gist_url_or_id")
+@click.option("--teleport", "-t", is_flag=True, help="Teleport into the session after import")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["local", "docker", "microvm"]),
+    default="docker",
+    help="Teleport mode: local, docker, or microvm (default: docker)",
+)
 @click.pass_context
-def gist_import(ctx: click.Context, gist_url_or_id: str) -> None:
+def gist_import(ctx: click.Context, gist_url_or_id: str, teleport: bool, mode: str) -> None:
     """Import a session from a GitHub gist."""
     import asyncio
+    import os
+    import subprocess
 
     from rich.console import Console
 
@@ -195,13 +205,53 @@ def gist_import(ctx: click.Context, gist_url_or_id: str) -> None:
         result = await importer.import_from_gist(gist_url_or_id)
 
         if result.success:
-            console.print(f"[green]Imported successfully![/green]")
-            console.print(f"  Session: {result.session_id}")
-            console.print(f"  Project: {result.project_path}")
-            console.print(f"  Messages: {result.message_count}")
-            console.print(f"  Checkpoints: {result.checkpoint_count}")
+            if result.already_imported:
+                console.print(f"[yellow]Already imported[/yellow]")
+                console.print(f"  Session: {result.session_id}")
+                console.print(f"  Project: {result.project_path}")
+            else:
+                console.print(f"[green]Imported successfully![/green]")
+                console.print(f"  Session: {result.session_id}")
+                console.print(f"  Project: {result.project_path}")
+                console.print(f"  Messages: {result.message_count}")
+                console.print(f"  Checkpoints: {result.checkpoint_count}")
+
+            if teleport:
+                console.print(f"\n[cyan]Teleporting into session (mode: {mode})...[/cyan]")
+                await do_teleport(result.session_id, result.project_path, mode, console)
         else:
             console.print(f"[red]Import failed: {result.error}[/red]")
+
+    async def do_teleport(session_id: str, project_path: str, mode: str, console: Console):
+        from one_claude.core.scanner import ClaudeScanner
+        from one_claude.teleport.restore import FileRestorer
+
+        scanner = ClaudeScanner(config.claude_dir)
+        restorer = FileRestorer(scanner)
+
+        # Find the imported session
+        session = scanner.get_session_by_id(session_id)
+        if not session:
+            console.print(f"[red]Could not find imported session: {session_id}[/red]")
+            return
+
+        # Restore to sandbox (latest message)
+        teleport_session = await restorer.restore_to_sandbox(
+            session,
+            message_uuid=None,  # Latest
+            mode=mode,
+        )
+
+        sandbox = teleport_session.sandbox
+
+        # Get shell command
+        shell_cmd = sandbox.get_shell_command(term=os.environ.get("TERM"))
+
+        # Run the teleport command
+        try:
+            subprocess.run(shell_cmd, cwd=sandbox.working_dir)
+        finally:
+            await sandbox.stop()
 
     asyncio.run(do_import())
 

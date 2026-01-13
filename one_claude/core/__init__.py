@@ -9,6 +9,7 @@ from one_claude.core.models import (
     FileCheckpoint,
     ToolUse,
     ToolResult,
+    escape_project_path,
 )
 from one_claude.core.parser import SessionParser
 from one_claude.core.scanner import ClaudeScanner
@@ -24,4 +25,5 @@ __all__ = [
     "ToolResult",
     "SessionParser",
     "ClaudeScanner",
+    "escape_project_path",
 ]

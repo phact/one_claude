@@ -8,7 +8,16 @@ from pathlib import Path
 
 import orjson
 
+from one_claude.core import escape_project_path
 from one_claude.gist.api import GistAPI
+
+# Namespace for generating deterministic session IDs from gist IDs
+GIST_NAMESPACE = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+
+def gist_to_session_id(gist_id: str) -> str:
+    """Generate a deterministic session ID from a gist ID."""
+    return str(uuid.uuid5(GIST_NAMESPACE, gist_id))
 
 
 @dataclass
@@ -21,16 +30,7 @@ class ImportResult:
     error: str | None
     message_count: int
     checkpoint_count: int
-
-
-def _escape_path(path: str) -> str:
-    """Escape path for Claude's project directory naming.
-
-    Claude escapes paths by replacing / with - for directory names.
-    """
-    # Remove leading slash and replace / with -
-    escaped = path.lstrip("/").replace("/", "-")
-    return escaped
+    already_imported: bool = False
 
 
 def _parse_gist_id(url_or_id: str) -> str:
@@ -60,6 +60,8 @@ def _is_base64(s: str) -> bool:
         return b"\x00" in decoded[:1024]
     except Exception:
         return False
+
+
 
 
 class SessionImporter:
@@ -135,33 +137,46 @@ class SessionImporter:
                 checkpoint_count=0,
             )
 
-        # Generate new session ID to avoid collisions
-        new_session_id = str(uuid.uuid4())
+        # Generate deterministic session ID from gist ID
+        session_id = gist_to_session_id(gist_id)
 
         # Get project path from export
         session_info = export_data.get("session", {})
         project_path = session_info.get("project_path", "/imported")
 
         # Create project directory
-        project_dir_name = _escape_path(project_path)
+        project_dir_name = escape_project_path(project_path)
         project_dir = self.claude_dir / "projects" / project_dir_name
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        # Reconstruct JSONL from messages
+        # Check if already imported
+        jsonl_path = project_dir / f"{session_id}.jsonl"
+        if jsonl_path.exists():
+            return ImportResult(
+                success=True,
+                session_id=session_id,
+                project_path=project_path,
+                error=None,
+                message_count=0,
+                checkpoint_count=0,
+                already_imported=True,
+            )
+
+        # Write messages directly (already in native Claude format)
         messages = export_data.get("messages", [])
         jsonl_lines = []
 
         for msg_data in messages:
-            # Update session ID in each message
-            msg_data["sessionId"] = new_session_id
+            # Only update session ID to match our deterministic ID
+            msg_data["sessionId"] = session_id
             jsonl_lines.append(orjson.dumps(msg_data).decode())
 
         # Write JSONL file
-        jsonl_path = project_dir / f"{new_session_id}.jsonl"
+        jsonl_path = project_dir / f"{session_id}.jsonl"
         jsonl_path.write_text("\n".join(jsonl_lines) + "\n")
 
         # Restore checkpoints
-        file_history_dir = self.claude_dir / "file-history" / new_session_id
+        file_history_dir = self.claude_dir / "file-history" / session_id
         file_history_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_count = 0
@@ -198,7 +213,7 @@ class SessionImporter:
 
         return ImportResult(
             success=True,
-            session_id=new_session_id,
+            session_id=session_id,
             project_path=project_path,
             error=None,
             message_count=len(messages),
