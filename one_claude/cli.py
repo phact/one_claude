@@ -445,5 +445,182 @@ def gist_list() -> None:
     console.print(table)
 
 
+@main.command()
+@click.argument("session_id")
+@click.option("--format", "-f", default="rich", type=click.Choice(["rich", "markdown", "text", "json"]), help="Output format")
+@click.option("--output", "-o", type=click.Path(), help="Save to file instead of printing")
+@click.option("--numbered", "-n", is_flag=True, help="Number each thinking block")
+@click.pass_context
+def plans(ctx: click.Context, session_id: str, format: str, output: str | None, numbered: bool) -> None:
+    """Extract and display thinking blocks (plans) from a session.
+
+    This command extracts all thinking blocks from Claude's responses in a session
+    and presents them in a readable format. Thinking blocks contain Claude's internal
+    reasoning, planning, and problem-solving process.
+    """
+    import json
+    from datetime import datetime
+
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    from one_claude.core.models import MessageType
+    from one_claude.core.scanner import ClaudeScanner
+
+    config = ctx.obj["config"]
+    scanner = ClaudeScanner(config.claude_dir)
+    console = Console()
+
+    # Find the session
+    session_obj = None
+    for project in scanner.scan_all():
+        for session in project.sessions:
+            if session.id == session_id or session.id.startswith(session_id):
+                session_obj = session
+                break
+        if session_obj:
+            break
+
+    if not session_obj:
+        console.print(f"[red]Session not found: {session_id}[/red]")
+        return
+
+    # Load messages
+    tree = scanner.load_session_messages(session_obj)
+    messages = tree.get_main_thread()
+
+    # Extract thinking blocks
+    thinking_blocks = []
+    for idx, msg in enumerate(messages):
+        if msg.type == MessageType.ASSISTANT and msg.thinking:
+            thinking_blocks.append({
+                "index": idx + 1,
+                "message_uuid": msg.uuid,
+                "timestamp": msg.timestamp,
+                "thinking": msg.thinking.content if hasattr(msg.thinking, 'content') else str(msg.thinking),
+                "text_preview": msg.text_content[:100] if msg.text_content else "",
+                "tool_uses": [t.name for t in msg.tool_uses] if msg.tool_uses else [],
+            })
+
+    if not thinking_blocks:
+        console.print(f"[yellow]No thinking blocks found in session {session_id}[/yellow]")
+        return
+
+    # Format and output
+    if format == "json":
+        # Convert datetime objects to strings for JSON serialization
+        json_blocks = []
+        for block in thinking_blocks:
+            json_block = block.copy()
+            if isinstance(json_block["timestamp"], datetime):
+                json_block["timestamp"] = json_block["timestamp"].isoformat()
+            json_blocks.append(json_block)
+
+        output_data = {
+            "session_id": session_obj.id,
+            "title": session_obj.title,
+            "thinking_blocks": json_blocks,
+        }
+        if output:
+            with open(output, "w") as f:
+                json.dump(output_data, f, indent=2)
+            console.print(f"[green]Saved to {output}[/green]")
+        else:
+            console.print_json(data=output_data)
+
+    elif format == "markdown":
+        lines = [
+            f"# Plans and Thinking: {session_obj.title or session_id}",
+            "",
+            f"**Session:** `{session_obj.id}`",
+            f"**Project:** {session_obj.project_display}",
+            f"**Thinking blocks found:** {len(thinking_blocks)}",
+            "",
+            "---",
+            "",
+        ]
+
+        for block in thinking_blocks:
+            lines.append(f"## Block {block['index']}")
+            lines.append(f"*Message {block['index']} at {block['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}*")
+            if block['tool_uses']:
+                lines.append(f"*Tools: {', '.join(block['tool_uses'])}*")
+            lines.append("")
+            lines.append(block['thinking'])
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+        md_content = "\n".join(lines)
+        if output:
+            with open(output, "w") as f:
+                f.write(md_content)
+            console.print(f"[green]Saved to {output}[/green]")
+        else:
+            console.print(Markdown(md_content))
+
+    elif format == "text":
+        lines = [
+            f"Plans and Thinking: {session_obj.title or session_id}",
+            f"Session: {session_obj.id}",
+            f"Project: {session_obj.project_display}",
+            f"Thinking blocks found: {len(thinking_blocks)}",
+            "",
+            "=" * 80,
+            "",
+        ]
+
+        for block in thinking_blocks:
+            lines.append(f"Block {block['index']}")
+            lines.append(f"Message {block['index']} at {block['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+            if block['tool_uses']:
+                lines.append(f"Tools: {', '.join(block['tool_uses'])}")
+            lines.append("")
+            lines.append(block['thinking'])
+            lines.append("")
+            lines.append("-" * 80)
+            lines.append("")
+
+        text_content = "\n".join(lines)
+        if output:
+            with open(output, "w") as f:
+                f.write(text_content)
+            console.print(f"[green]Saved to {output}[/green]")
+        else:
+            console.print(text_content)
+
+    else:  # rich format
+        console.print()
+        console.print(f"[bold cyan]Plans and Thinking[/bold cyan]")
+        console.print(f"[dim]Session: {session_obj.id}[/dim]")
+        console.print(f"[dim]Project: {session_obj.project_display}[/dim]")
+        console.print(f"[dim]Thinking blocks found: {len(thinking_blocks)}[/dim]")
+        console.print()
+
+        for i, block in enumerate(thinking_blocks):
+            # Create header with metadata
+            header_lines = [f"Message {block['index']}"]
+            if block['timestamp']:
+                header_lines.append(f"at {block['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+            if block['tool_uses']:
+                header_lines.append(f"• Tools: {', '.join(block['tool_uses'])}")
+
+            header = " ".join(header_lines)
+
+            # Show thinking block in a panel
+            console.print(
+                Panel(
+                    block['thinking'],
+                    title=f"[cyan]{'#' + str(i+1) + ' - ' if numbered else ''}Thinking Block[/cyan]",
+                    subtitle=f"[dim]{header}[/dim]",
+                    border_style="cyan",
+                    expand=True,
+                )
+            )
+            console.print()
+
+
 if __name__ == "__main__":
     main()

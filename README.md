@@ -19,7 +19,45 @@ TUI manager for Claude Code sessions - browse, search, and teleport across time.
 ```bash
 # Launch TUI
 uvx one_claude
+
+# List all sessions
+uvx one_claude sessions
+
+# Show a specific session
+uvx one_claude show <session-id>
+
+# Search sessions
+uvx one_claude search "query" --mode text
+
+# Extract thinking blocks (plans) from a session
+uvx one_claude plans <session-id>
 ```
+
+## Commands
+
+### `plans` - Extract Thinking Blocks
+
+Extract and display Claude's internal thinking blocks (plans) from a session in a readable format.
+
+```bash
+# Display thinking blocks in rich format (default)
+uvx one_claude plans <session-id>
+
+# Export to markdown
+uvx one_claude plans <session-id> --format markdown --output plans.md
+
+# Export to JSON
+uvx one_claude plans <session-id> --format json --output plans.json
+
+# Show with numbered blocks
+uvx one_claude plans <session-id> --numbered
+```
+
+**Formats:**
+- `rich` (default): Beautiful terminal output with panels and colors
+- `markdown`: Formatted markdown with headers and sections
+- `text`: Plain text format
+- `json`: Structured JSON for programmatic access
 
 ## Keyboard Shortcuts
 
